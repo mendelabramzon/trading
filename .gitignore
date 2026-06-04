@@ -1,0 +1,183 @@
+# ============================================================
+# Rust / Cargo
+# ============================================================
+
+/target/
+**/*.rs.bk
+
+# Do NOT ignore Cargo.lock.
+
+
+# ============================================================
+# Secrets / credentials
+# ============================================================
+
+.env
+.env.*
+!.env.example
+
+secrets/
+credentials/
+keys/
+
+*.key
+*.pem
+*.crt
+*.p12
+*.pfx
+
+# Exchange / RPC / wallet configs
+config/local.*
+config/secrets.*
+config/*.local.*
+config/*.secret.*
+
+
+# ============================================================
+# Trading runtime data
+# ============================================================
+
+# architecture writes WAL and Parquet here.
+data/
+wal/
+parquet/
+
+# Market data / historical data
+market_data/
+tick_data/
+ohlcv/
+orderbooks/
+snapshots/
+
+# Trading state
+state/
+storage/
+runtime/
+checkpoints/
+
+# Strategy outputs
+backtests/
+reports/
+results/
+runs/
+research_outputs/
+
+# Execution logs / private trading records
+fills/
+trades/
+orders/
+positions/
+pnl/
+
+
+# ============================================================
+# Large data file formats
+# ============================================================
+
+*.wal
+*.parquet
+*.arrow
+*.ipc
+*.feather
+*.csv
+*.csv.gz
+*.jsonl
+*.jsonl.gz
+
+
+# ============================================================
+# IPC / sockets / shared memory artifacts
+# ============================================================
+
+*.sock
+*.socket
+*.pid
+
+# If you create local runtime dirs for UDS/SHM
+tmp/
+temp/
+run/
+
+
+# ============================================================
+# Logs
+# ============================================================
+
+logs/
+*.log
+
+
+# ============================================================
+# Local databases
+# ============================================================
+
+*.db
+*.sqlite
+*.sqlite3
+
+
+# ============================================================
+# Docker / local infra
+# ============================================================
+
+docker-compose.override.yml
+docker-compose.local.yml
+
+.env.docker
+.env.local
+
+
+# ============================================================
+# IDE / editor
+# ============================================================
+
+.vscode/
+.idea/
+*.swp
+*.swo
+*.iml
+.claude/
+
+
+# ============================================================
+# OS junk
+# ============================================================
+
+.DS_Store
+Thumbs.db
+
+
+# ============================================================
+# Python helpers / notebooks
+# ============================================================
+
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+.venv/
+venv/
+
+
+# ============================================================
+# Frontend / dashboard, if added later
+# ============================================================
+
+node_modules/
+dist/
+build/
+.next/
+
+
+# ============================================================
+# Coverage / profiling / benchmarks
+# ============================================================
+
+coverage/
+tarpaulin-report.html
+
+*.profraw
+*.profdata
+perf.data
+flamegraph.svg
+criterion/

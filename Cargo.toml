@@ -1,0 +1,3 @@
+[workspace]                                                                     
+  members = ["crates/venue-core", "crates/venue-adapter", "crates/venue-binance"]                                                 
+  resolver = "2"  
