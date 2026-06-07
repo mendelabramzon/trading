@@ -1,3 +1,7 @@
 [workspace]                                                                     
-  members = ["crates/venue-core", "crates/venue-adapter", "crates/venue-binance"]                                                 
-  resolver = "2"  
+  members = ["crates/venue-core", "crates/venue-adapter", "crates/venue-binance", "crates/wire", "crates/recorder"]                                                 
+  resolver = "2"
+
+[workspace.dependencies]
+  tracing = "0.1"
+  tracing-subscriber = { version = "0.3", features = ["env-filter"] }

@@ -3,13 +3,15 @@ use venue_adapter::*;
 use async_trait::async_trait;
 use serde::Deserialize;
 use rust_decimal::Decimal;
-use tokio::task::JoinHandle;
 use tokio::net::TcpStream;
-use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream,WebSocketStream};
-use futures_util::{SinkExt, StreamExt, stream::SplitSink};
+use tokio_tungstenite::{tungstenite::Message, MaybeTlsStream,WebSocketStream};
+use futures_util::{stream::SplitSink};
+mod ws_pool;
 
 const BASE_REST_URL: &str = "https://fapi.binance.com";
-const BASE_WS_URL: &str = "wss://fstream.binance.com/ws/";
+const BASE_WS_URL: &str = "wss://fstream.binance.com/ws";
+const MAX_STREAMS_PER_CONN: usize = 200;
+
 
 type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 type WsWriter = SplitSink<WsStream, Message>;
@@ -82,8 +84,7 @@ type WsWriter = SplitSink<WsStream, Message>;
   pub struct BinanceAdapter<S: EventSink> {
       venue_id: VenueId,
       sink: S,
-      ws_writer: Option<WsWriter>,
-      read_handle: Option<JoinHandle<()>>,
+      pool: ws_pool::WsPool,
       next_id: u64,
   }
 
@@ -92,8 +93,7 @@ type WsWriter = SplitSink<WsStream, Message>;
           Self { 
             venue_id: VenueId { value: "binance".to_string() }, 
             sink,
-            ws_writer: None,
-            read_handle: None,
+            pool: ws_pool::WsPool::new(MAX_STREAMS_PER_CONN),
             next_id: 0,
           }
       }
@@ -135,48 +135,59 @@ type WsWriter = SplitSink<WsStream, Message>;
       }
 
       async fn connect(&mut self) -> Result<(), VenueError> {
-
-        /// open a websocket
-          let (ws_stream, _) = connect_async(BASE_WS_URL)
-          .await
-          .map_err(|e| VenueError::ConnectionFailed(e.to_string()))?;
-        
-        /// split and store the writer
-        let (ws_writer, mut reader) = ws_stream.split();
-        self.ws_writer = Some(ws_writer);
-
-        /// clone, spawn, store the handle
-        let sink = self.sink.clone();
-        let venue_id = self.venue_id.clone();
-
-        self.read_handle = Some(tokio::spawn(async move {
-            while let Some(msg) = reader.next().await {
-                match msg {
-                    Ok(Message::Text(text)) => {
-                        handle_message(&text, &venue_id, &sink).await;
-                    }
-                    Ok(Message::Close(_)) | Err(_) => break,
-                    _ => {}
-                }
-            }
-        }));
-
         Ok(())
+    }
+
+
+/**   What the function should do
+
+  1. Convert each (InstrumentId, Vec<DataType>) pair into Binance stream names
+  2. Deduplicate — multiple DataTypes may produce the same stream name
+  3. Build the JSON subscribe message
+  4. Send it over self.ws_writer using SinkExt::send() (that's where the unused
+  SinkExt import gets used)
+  5. Increment self.next_id for the message id field (that's where next_id gets
+  used)
+  */
+
+
+  async fn subscribe(&mut self, subscriptions: Vec<Subscription>) -> Result<(),
+  VenueError> {
+      // build deduplicated streams (same as before)
+      let mut streams = std::collections::HashSet::new();
+      for sub in &subscriptions {
+          let symbol = &sub.instrument.value;
+          for dt in &sub.data_type {
+              let stream = match dt {
+                  DataType::BookTicker  => format!("{symbol}@bookTicker"),
+                  DataType::Trade       => format!("{symbol}@aggTrade"),
+                  DataType::BookDepth   => format!("{symbol}@depth@100ms"),
+                  DataType::FundingRate |
+                  DataType::MarkPrice   |
+                  DataType::IndexPrice  => format!("{symbol}@markPrice@1s"),
+              };
+              streams.insert(stream);
+          }
       }
 
-      async fn subscribe(&mut self, subscriptions: Vec<Subscription>) ->
-  Result<(), VenueError> {
-          todo!()
-      }
+      let streams: Vec<String> = streams.into_iter().collect();
 
-      async fn disconnect(&mut self) -> Result<(), VenueError> {
-          todo!()
-      }
+      // delegate to pool
+      self.pool.subscribe(streams, &self.sink, &self.venue_id, &mut
+  self.next_id).await
   }
 
-  async fn handle_message(text: &str, venue_id: &VenueId, sink: &EventSink) {
+  async fn disconnect(&mut self) -> Result<(), VenueError> {
+    self.pool.disconnect().await
+}
+  }
+
+
+// handle message function
+
+  async fn handle_message<S: EventSink> (text: &str, venue_id: &VenueId, sink: &S) {
         
-    /// Extract event type
+    // Extract event type
     
     let event_type: WsEventType = match serde_json::from_str(text) {
             Ok(e) => e,
@@ -188,11 +199,11 @@ type WsWriter = SplitSink<WsStream, Message>;
             .unwrap()
             .as_nanos() as u64;
 
-    /// match on event type, deserealize and send
+    // match on event type, deserealize and send
 
     match event_type.e.as_str() {
 
-    /// BookTicker message schema
+    // BookTicker message schema
         "bookTicker" => {
         let msg: BookTickerMsg = match serde_json::from_str(text) {
             Ok(m) => m,
@@ -206,14 +217,104 @@ type WsWriter = SplitSink<WsStream, Message>;
             local_ts: Some(now),
             payload: Payload::MarketData(MarketDataPayload::BookTicker {
                 best_bid: Level {price: msg.b, qty: msg.bq },
-                best_ask: Level {price: msg.a, qty: msg:aq },
+                best_ask: Level {price: msg.a, qty: msg.aq },
             }),
             sequence: None,
 
         }).await;
-       };
+       },
 
 
+       "aggTrade" => {
+        let msg: AggTradeMsg = match serde_json::from_str(text) {
+            Ok(m) => m,
+            Err(_) => return,
+        };
+
+        let side = if msg.m { AggressorSide::Sell } else { AggressorSide::Buy };
+
+        let _ = sink.send(Event{
+            venue: venue_id.clone(),
+            instrument: Some(InstrumentId { value: msg.s.to_lowercase()}),
+            venue_ts: Some(msg.time * 1_000_000), //ms -> ns
+            local_ts: Some(now),
+            payload: Payload::MarketData(MarketDataPayload::Trades {
+                trades: vec![Trade {price: msg.p, qty: msg.q, aggressor_side: side}],
+            }),
+            sequence: None,
+        }).await;
+       },
+
+
+
+       "depthUpdate" => {
+        let msg: DepthUpdateMsg = match serde_json::from_str(text) {
+            Ok(m) => m,
+            Err(_) => return,
+        };
+  
+        let bids = msg.b.into_iter().map(|(p, q)| Level { price: p, qty: q
+    }).collect();
+        let asks = msg.a.into_iter().map(|(p, q)| Level { price: p, qty: q
+    }).collect();
+  
+        let _ = sink.send(Event {
+            venue: venue_id.clone(),
+            instrument: Some(InstrumentId { value: msg.s.to_lowercase() }),
+            venue_ts: Some(msg.event_time * 1_000_000),
+            local_ts: Some(now),
+            payload: Payload::MarketData(MarketDataPayload::BookUpdate { bids, asks
+    }),
+            sequence: None,
+        }).await;
+    },
+
+
+
+    "markPriceUpdate" => {
+        let msg: MarkPriceUpdateMsg = match serde_json::from_str(text) {
+            Ok(m) => m,
+            Err(_) => return,
+        };
+  
+        let instrument = InstrumentId { value: msg.s.to_lowercase() };
+        let venue_ts = Some(msg.event_time * 1_000_000);
+  
+        let _ = sink.send(Event {
+            venue: venue_id.clone(),
+            instrument: Some(instrument.clone()),
+            venue_ts,
+            local_ts: Some(now),
+            payload: Payload::MarketData(MarketDataPayload::MarkPrice { price: msg.p
+     }),
+            sequence: None,
+        }).await;
+  
+        let _ = sink.send(Event {
+            venue: venue_id.clone(),
+            instrument: Some(instrument.clone()),
+            venue_ts,
+            local_ts: Some(now),
+            payload: Payload::MarketData(MarketDataPayload::IndexPrice { price:
+    msg.i }),
+            sequence: None,
+        }).await;
+  
+        let _ = sink.send(Event {
+            venue: venue_id.clone(),
+            instrument: Some(instrument),
+            venue_ts,
+            local_ts: Some(now),
+            payload: Payload::MarketData(MarketDataPayload::FundingRatePrediction {
+                rate: msg.r,
+                next_funding_time: msg.next_funding_time * 1_000_000,
+            }),
+            sequence: None,
+        }).await;
+    },
+  
+
+    _ => {},
 
 
     }

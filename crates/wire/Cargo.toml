@@ -1,0 +1,9 @@
+  [package]
+  name = "wire"
+  version = "0.1.0"
+  edition = "2021"
+
+  [dependencies]
+  venue-core = { path = "../venue-core" }
+  rmp-serde = "1"
+  serde = { version = "1", features = ["derive"] }

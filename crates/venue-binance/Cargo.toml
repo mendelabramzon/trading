@@ -14,3 +14,8 @@
   tokio-tungstenite = { version = "0.26", features = ["native-tls"] }
   futures-util = "0.3"
   rust_decimal = { version = "1", features = ["serde-with-str"] }
+  tracing = { workspace = true }
+
+  [dev-dependencies]
+  recorder = { path = "../recorder" }
+  tracing-subscriber = { workspace = true }

@@ -1,0 +1,13 @@
+  [package]
+  name = "recorder"
+  version = "0.1.0"
+  edition = "2021"
+
+  [dependencies]
+  venue-core = { path = "../venue-core" }
+  wire = { path = "../wire" }
+  chrono = "0.4"
+  num-traits = "0.2"                                        
+  arrow = { version = "55", features = ["prettyprint"] }
+  parquet = { version = "55", features = ["arrow"] }
+  tracing = { workspace = true }
