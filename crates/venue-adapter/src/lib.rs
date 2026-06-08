@@ -31,6 +31,7 @@ pub trait EventSink: Send + Sync + Clone + 'static {
     async fn send(&self, event: Event) -> Result<(), EventSinkError>;
 }
 
+#[derive(Debug)]
 pub enum EventSinkError {
     Closed,
     Full,

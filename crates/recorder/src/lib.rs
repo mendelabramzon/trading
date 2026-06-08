@@ -10,7 +10,7 @@ use chrono::Utc;
 pub mod parquet_converter;
 
 pub struct WalWriter {
-    tx: mpsc::SyncSender<Event>,
+    tx: Option<mpsc::SyncSender<Event>>,
     handle: Option<thread::JoinHandle<()>>,
 }
 
@@ -23,13 +23,17 @@ impl WalWriter {
         });
 
         Self {
-            tx,
+            tx: Some(tx),
             handle: Some(handle),
         }
     }
 
     pub fn send(&self, event: &Event) {
-        let _ = self.tx.send(event.clone());
+        if let Some(tx) = &self.tx {
+            if let Err(_) = tx.send(event.clone()) {
+                tracing::warn!("WAL event dropped: channel full or closed");
+            }
+        }
     }
 
     fn run(base_dir: PathBuf, rx: mpsc::Receiver<Event>) {
@@ -47,6 +51,7 @@ impl WalWriter {
                 let dir = base_dir.join(venue);
                 fs::create_dir_all(&dir).expect("failed to create WAL dir");
                 let path = dir.join(format!("{date}.wal"));
+                tracing::info!(path = %path.display(), "opening WAL file");
                 let file = OpenOptions::new()
                     .create(true)
                     .append(true)
@@ -57,8 +62,35 @@ impl WalWriter {
 
             // encode and write
             buf.clear();
-            if wire::encode(&event, &mut buf).is_ok() {
-                let _ = writer.write_all(&buf);
+            if let Err(e) = wire::encode(&event, &mut buf) {
+                tracing::warn!(error = ?e, "wire encode failed, event dropped");
+            } else {
+                if let Err(e) = writer.write_all(&buf) {
+                    tracing::warn!(error = %e, "WAL write failed");
+                }
+            }
+        }
+
+        // rx.recv() returned Err — all senders dropped. Flush everything.
+        for (key, mut writer) in writers.drain() {
+            if let Err(e) = writer.flush() {
+                tracing::warn!(key, error = %e, "failed to flush WAL on shutdown");
+            }
+        }
+        tracing::info!("WAL writer thread exiting cleanly");
+    }
+}
+
+impl Drop for WalWriter {
+    fn drop(&mut self) {
+        // Drop the sender first — this causes rx.recv() to return Err,
+        // which breaks the loop and triggers flush.
+        drop(self.tx.take());
+
+        // Wait for the thread to finish flushing.
+        if let Some(handle) = self.handle.take() {
+            if let Err(_) = handle.join() {
+                tracing::warn!("WAL writer thread panicked");
             }
         }
     }
