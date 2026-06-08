@@ -1,8 +1,6 @@
-
-
-use serde::{Deserialize, Serialize};
 use rust_decimal::Decimal;
-
+use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
 //System Types
 // ------------------------------------------------------------
@@ -44,7 +42,7 @@ pub struct Trade {
 // Instrument Id
 #[derive(Debug, Clone, Serialize, Deserialize, Hash, Eq, PartialEq)]
 pub struct InstrumentId {
-    pub value: String,
+    pub value: Arc<str>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -53,7 +51,7 @@ pub enum InstrumentKind {
     Perp,
 }
 
-// Instrument 
+// Instrument
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Instrument {
     pub id: InstrumentId,
@@ -62,15 +60,13 @@ pub struct Instrument {
     pub quote: String,
 }
 
-
 // Venue Types
 // ------------------------------------------------------------
-
 
 // Venue Id
 #[derive(Debug, Clone, Serialize, Deserialize, Hash, Eq, PartialEq)]
 pub struct VenueId {
-    pub value: String,
+    pub value: Arc<str>,
 }
 
 // Venue

@@ -2,7 +2,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::{InstrumentId, Nanos, Payload, Sequence, VenueId};
 
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Event {
     pub venue: VenueId,
@@ -12,4 +11,3 @@ pub struct Event {
     pub payload: Payload,
     pub sequence: Option<Sequence>,
 }
-

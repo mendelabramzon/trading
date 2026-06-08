@@ -7,7 +7,12 @@
   venue-core = { path = "../venue-core" }
   wire = { path = "../wire" }
   chrono = "0.4"
-  num-traits = "0.2"                                        
+  num-traits = "0.2"
   arrow = { version = "55", features = ["prettyprint"] }
   parquet = { version = "55", features = ["arrow"] }
   tracing = { workspace = true }
+
+  [dev-dependencies]
+  tempfile = "3"
+  rust_decimal = "1"
+  rust_decimal_macros = "1"

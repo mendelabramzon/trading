@@ -1,9 +1,9 @@
-use venue_adapter::{VenueAdapter, Subscription, DataType};
-use venue_core::{Event, InstrumentId};
-use tokio::sync::mpsc;
 use recorder::WalWriter;
 use std::path::PathBuf;
+use tokio::sync::mpsc;
 use tracing::info;
+use venue_adapter::{DataType, Subscription, VenueAdapter};
+use venue_core::{Event, InstrumentId};
 
 #[tokio::main]
 async fn main() {
@@ -25,11 +25,15 @@ async fn main() {
 
     let subs = vec![
         Subscription {
-            instrument: InstrumentId { value: "btcusdt".into() },
+            instrument: InstrumentId {
+                value: "btcusdt".into(),
+            },
             data_type: vec![DataType::BookTicker, DataType::Trade],
         },
         Subscription {
-            instrument: InstrumentId { value: "ethusdt".into() },
+            instrument: InstrumentId {
+                value: "ethusdt".into(),
+            },
             data_type: vec![DataType::BookTicker],
         },
     ];

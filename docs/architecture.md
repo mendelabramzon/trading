@@ -38,18 +38,18 @@ pluggable without changing venue or consumer code.
 
 | Crate            | Purpose                                                                      |
 |------------------|------------------------------------------------------------------------------|
-| `venue-core`     | Domain types: `Event`, `Payload`, `MarketDataPayload`, `Level`, `Trade`, `InstrumentId`, `VenueId`, `Nanos`, `Sequence`, `Instrument`, `Lifecycle` |
+| `venue-core`     | Domain types: `Event`, `Payload`, `MarketDataPayload`, `Level`, `Trade`, `InstrumentId`, `VenueId`, `Nanos`, `Sequence`, `Instrument` |
 | `venue-adapter`  | Traits: `VenueAdapter<S: EventSink>`, `EventSink`, `Subscription`, `DataType`, `VenueError` |
 | `venue-binance`  | Binance Futures adapter: `BinanceAdapter<S>`                                  |
+| `wire`           | MessagePack via rmp-serde with length-prefixed framing. `encode(Event) -> bytes`, `decode(bytes) -> Event`. Display + Error on WireError. |
+| `recorder`       | WAL writer (dedicated thread, periodic fsync) + Parquet converter (all 8 data types, BufReader streaming decode). |
 
 ### Planned
 
 | Crate            | Purpose                                                                       |
 |------------------|-------------------------------------------------------------------------------|
-| `wire`           | Binary serialization for IPC. `encode(Event) -> bytes`, `decode(bytes) -> Event`. Phase 1: bincode. Phase 2: zero-copy layout. |
 | `transport`      | `EventSink` implementations for IPC. `UdsSink`/`UdsSource` (Phase 1), `ShmSink`/`ShmSource` (Phase 2). |
 | `event-bus`      | Central event distribution. Receives from venue processes, topic-filters, fans out to consumers. |
-| `recorder`       | WAL writer (hot path) + background Parquet converter.                         |
 | `replay`         | Reads Parquet, emits events through `EventSink`. Indistinguishable from live. |
 | `venue-process`  | Thin binary harness: boots a `VenueAdapter`, wires transport, handles signals. |
 
@@ -159,7 +159,7 @@ message format, and limits differ per venue.
 
 Binary encoding for `Event`. Length-prefixed frames: `[len: u32][payload bytes]`.
 
-Phase 1: bincode serialization (fast, compact, minimal code).
+Phase 1: MessagePack via rmp-serde (fast, compact, minimal code).
 Phase 2: hand-rolled zero-copy layout with `EventRef<'a>` that borrows from the
 buffer, eliminating allocations on the read path.
 
@@ -276,8 +276,10 @@ Schemas per data type:
 ```
 BookTicker:  instrument, venue_ts, local_ts, bid_price, bid_qty, ask_price, ask_qty
 Trades:      instrument, venue_ts, local_ts, price, qty, aggressor_side
+BookSnapshot: instrument, venue_ts, local_ts, side, level_idx, price, qty
 BookUpdate:  instrument, venue_ts, local_ts, bids[{price,qty}], asks[{price,qty}]
 FundingRate: instrument, venue_ts, local_ts, rate, next_funding_time
+FundingRateRealized: instrument, venue_ts, local_ts, rate, funding_time
 MarkPrice:   instrument, venue_ts, local_ts, price
 IndexPrice:  instrument, venue_ts, local_ts, price
 ```
@@ -296,8 +298,10 @@ data/
       2026-06-04/
         book_ticker.parquet
         trades.parquet
+        book_snapshot.parquet
         book_update.parquet
         funding_rate.parquet
+        funding_rate_realized.parquet
         mark_price.parquet
         index_price.parquet
     bybit/

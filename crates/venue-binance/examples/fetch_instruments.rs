@@ -1,7 +1,7 @@
+use tokio::sync::mpsc;
 use venue_adapter::EventSink;
 use venue_adapter::VenueAdapter;
 use venue_core::Event;
-use tokio::sync::mpsc;
 
 #[tokio::main]
 async fn main() {

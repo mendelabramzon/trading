@@ -1,12 +1,14 @@
+use crate::{handle_message, WsReader, WsWriter, BASE_WS_URL};
+use futures_util::{SinkExt, StreamExt};
+use std::sync::atomic::AtomicU64;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::task::JoinHandle;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_util::sync::CancellationToken;
-use futures_util::{SinkExt, StreamExt};
 use venue_adapter::{EventSink, VenueError};
 use venue_core::VenueId;
-use crate::{WsReader, WsWriter, handle_message, BASE_WS_URL};
 
 struct ExponentialBackoff {
     current: Duration,
@@ -56,6 +58,7 @@ impl WsPool {
         sink: &S,
         venue_id: &VenueId,
         next_id: &mut u64,
+        seq: &Arc<AtomicU64>,
     ) -> Result<(), VenueError> {
         for chunk in streams.chunks(self.max_streams_per_conn) {
             let chunk = chunk.to_vec();
@@ -80,7 +83,9 @@ impl WsPool {
                 "params": &chunk,
                 "id": *next_id,
             });
-            writer.send(Message::Text(msg.to_string().into())).await
+            writer
+                .send(Message::Text(msg.to_string().into()))
+                .await
                 .map_err(|e| VenueError::SubscriptionFailed(e.to_string()))?;
 
             tracing::info!(
@@ -94,9 +99,16 @@ impl WsPool {
             let sink = sink.clone();
             let venue_id = venue_id.clone();
             let cancel_clone = cancel.clone();
+            let seq = Arc::clone(seq);
 
             let handle = tokio::spawn(connection_task_with_reader(
-                reader, writer, chunk, sink, venue_id, cancel_clone,
+                reader,
+                writer,
+                chunk,
+                sink,
+                venue_id,
+                cancel_clone,
+                seq,
             ));
 
             self.conns.push(WsConn { cancel, handle });
@@ -106,7 +118,10 @@ impl WsPool {
     }
 
     pub(crate) async fn disconnect(&mut self) -> Result<(), VenueError> {
-        tracing::info!(connections = self.conns.len(), "disconnecting all WebSocket connections");
+        tracing::info!(
+            connections = self.conns.len(),
+            "disconnecting all WebSocket connections"
+        );
 
         // Cancel all tasks
         for conn in &self.conns {
@@ -118,7 +133,8 @@ impl WsPool {
         let _ = tokio::time::timeout(
             Duration::from_secs(3),
             futures_util::future::join_all(handles),
-        ).await;
+        )
+        .await;
 
         Ok(())
     }
@@ -133,6 +149,7 @@ async fn connection_task_with_reader<S: EventSink>(
     sink: S,
     venue_id: VenueId,
     cancel: CancellationToken,
+    seq: Arc<AtomicU64>,
 ) {
     // Read from the initial connection
     loop {
@@ -140,7 +157,7 @@ async fn connection_task_with_reader<S: EventSink>(
             msg = reader.next() => {
                 match msg {
                     Some(Ok(Message::Text(text))) => {
-                        handle_message(&text, &venue_id, &sink).await;
+                        handle_message(&text, &venue_id, &sink, &seq).await;
                     }
                     Some(Ok(Message::Ping(data))) => {
                         let _ = writer.send(Message::Pong(data)).await;
@@ -169,7 +186,7 @@ async fn connection_task_with_reader<S: EventSink>(
     }
 
     // Initial reader disconnected — enter the reconnect loop
-    reconnect_loop(streams, sink, venue_id, cancel).await;
+    reconnect_loop(streams, sink, venue_id, cancel, seq).await;
 }
 
 /// Outer loop: backoff → connect → subscribe → inner read loop.
@@ -179,6 +196,7 @@ async fn reconnect_loop<S: EventSink>(
     sink: S,
     venue_id: VenueId,
     cancel: CancellationToken,
+    seq: Arc<AtomicU64>,
 ) {
     let mut backoff = ExponentialBackoff::new();
     let mut sub_id: u64 = 1;
@@ -219,7 +237,10 @@ async fn reconnect_loop<S: EventSink>(
             continue;
         }
 
-        tracing::info!(streams = streams.len(), "WebSocket reconnected, resubscribed");
+        tracing::info!(
+            streams = streams.len(),
+            "WebSocket reconnected, resubscribed"
+        );
         backoff.reset();
 
         // Inner read loop
@@ -228,7 +249,7 @@ async fn reconnect_loop<S: EventSink>(
                 msg = reader.next() => {
                     match msg {
                         Some(Ok(Message::Text(text))) => {
-                            handle_message(&text, &venue_id, &sink).await;
+                            handle_message(&text, &venue_id, &sink, &seq).await;
                         }
                         Some(Ok(Message::Ping(data))) => {
                             let _ = writer.send(Message::Pong(data)).await;

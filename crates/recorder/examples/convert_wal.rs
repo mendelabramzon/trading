@@ -1,6 +1,6 @@
-use std::path::Path;                                                            
-use recorder::parquet_converter::convert_wal;                                   
-                                                          
+use recorder::parquet_converter::convert_wal;
+use std::path::Path;
+
 fn main() {
     let wal_path = Path::new("data/wal/binance/2026-06-05.wal");
     let output_dir = Path::new("data/parquet/binance/2026-06-05");
@@ -12,8 +12,7 @@ fn main() {
             for entry in std::fs::read_dir(output_dir).unwrap() {
                 let entry = entry.unwrap();
                 let size = entry.metadata().unwrap().len();
-                println!("  {} ({} bytes)", entry.file_name().to_string_lossy(),
- size);
+                println!("  {} ({} bytes)", entry.file_name().to_string_lossy(), size);
             }
         }
         Err(e) => println!("Error: {e}"),

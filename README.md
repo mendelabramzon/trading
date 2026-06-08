@@ -173,11 +173,11 @@ graph LR
 |-------|--------|---------|
 | `venue-core` | built | Domain types: `Event`, `Payload`, `Level`, `Trade`, `InstrumentId`, `VenueId`, `Nanos` |
 | `venue-adapter` | built | Traits: `VenueAdapter<S: EventSink>`, `EventSink`, `Subscription`, `DataType` |
-| `venue-binance` | wip | Binance Futures adapter with WsPool sharding |
-| `wire` | planned | Binary event serialization for IPC |
+| `venue-binance` | built | Binance Futures adapter with WsPool sharding |
+| `wire` | built | Binary event serialization for IPC |
 | `transport` | planned | `EventSink` impls: `UdsSink` (Phase 1), `ShmSink` (Phase 2) |
 | `event-bus` | planned | Central pub/sub event router with topic filtering |
-| `recorder` | planned | WAL hot capture + Parquet conversion |
+| `recorder` | built | WAL hot capture + Parquet conversion |
 | `replay` | planned | Parquet reader, emits events through `EventSink` |
 
 ## IPC Transport Phases

@@ -7,3 +7,7 @@
   venue-core = { path = "../venue-core" }
   rmp-serde = "1"
   serde = { version = "1", features = ["derive"] }
+
+  [dev-dependencies]
+  rust_decimal = "1"
+  rust_decimal_macros = "1"

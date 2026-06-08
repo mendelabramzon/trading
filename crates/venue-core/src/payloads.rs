@@ -1,4 +1,4 @@
-use crate::types::{Level, Trade, Nanos};
+use crate::types::{Level, Nanos, Trade};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
@@ -37,7 +37,7 @@ pub enum MarketDataPayload {
     IndexPrice {
         price: Decimal,
     },
-   Trades {
+    Trades {
         trades: Vec<Trade>,
     },
 }

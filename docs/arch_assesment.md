@@ -1,439 +1,269 @@
-# Codebase Assessment
+# Architecture Assessment
 
-## What's Working Well
+*Assessed against code as of 2026-06-08. ~1,771 lines of Rust across 5 crates,
+~133 lines of examples, 4.3 MB of recorded Binance data.*
 
-The architecture design is strong. The `EventSink` trait as the single abstraction
-boundary is the right call — it gives you pluggable transport (`mpsc` → UDS →
-SHM) without touching venue or consumer code. The workspace layout is clean, the
-domain types in `venue-core` are well-modeled, and the WAL → Parquet pipeline is
-a proven pattern used by serious quant shops. The architecture doc is unusually
-thorough for a project at this stage.
+## Current State
 
-The Binance adapter works end-to-end: REST instrument fetch, WebSocket
-connection sharding, stream deduplication, message parsing, and event emission.
-You have real data in `data/wal/` proving the pipeline runs.
+Five crates form a working single-venue data collection pipeline: Binance
+Futures WebSocket -> MessagePack WAL -> Parquet.
 
-## Bugs and Correctness Issues (Fix These First)
+| Crate | LOC | Role |
+|---|---|---|
+| `venue-core` | 148 | Domain types: `Event`, `Payload` (8 market data variants + error), `InstrumentId(Arc<str>)`, `VenueId(Arc<str>)`, `Level`, `Trade` |
+| `venue-adapter` | 81 | Trait definitions: `EventSink`, `VenueAdapter<S>`, `Subscription`, `DataType`; error types with `Display` + `Error` |
+| `venue-binance` | 640 | Binance Futures adapter: REST instrument fetch, `WsPool` with connection sharding, `#[serde(tag = "e")]` single-pass JSON deser, `AtomicU64` sequence numbers, exponential backoff reconnection |
+| `wire` | 189 | MessagePack via `rmp-serde` with length-prefixed framing (`[u32 len][payload]`); 6 roundtrip + edge-case tests |
+| `recorder` | 713 | `WalWriter` on dedicated OS thread with periodic fsync, `Drop` impl; Parquet converter streaming from `BufReader` for all 8 data types; 1 integration test |
 
-### 1. WalWriter has no graceful shutdown
+Four examples: `smoke` (full pipeline + clean shutdown), `fetch_instruments`,
+`read_wal`, `convert_wal`.
 
-`handle` is stored but never joined. No `Drop` impl. When `WalWriter` is dropped,
-the background thread may be killed mid-write, corrupting the WAL tail. The
-`BufWriter` never gets a final `flush()`.
+What doesn't exist: event bus, transport layer (UDS/SHM), replay, strategy
+engine, configuration system, second venue, CI pipeline.
+
+## What's Right
+
+**EventSink as the pluggability boundary.** The trait is minimal:
 
 ```rust
-// recorder/src/lib.rs:12-14
-pub struct WalWriter {
-    tx: mpsc::SyncSender<Event>,
-    handle: Option<thread::JoinHandle<()>>,  // never used
+#[async_trait]
+pub trait EventSink: Send + Sync + Clone + 'static {
+    async fn send(&self, event: Event) -> Result<(), EventSinkError>;
 }
 ```
 
-### 2. Silent event drops everywhere
+Every downstream consumer (WAL, future event bus, future strategy engine) slots
+in by implementing one method. Venue code is generic over `S: EventSink`,
+meaning transport changes require zero modifications to venue adapters. The
+`Clone` bound is correct — it means `Arc` internally, which is what you need
+for sharing a sink across spawned tasks. This single design decision is the
+most important thing in the codebase and it's right.
 
-`WalWriter::send()` discards events when the channel is full with
-`let _ = self.tx.send(...)`. In `handle_message`, every `sink.send()` result is
-discarded with `let _ =`. You have zero visibility into data loss. At 50k
-events/sec, you won't notice losing thousands of events.
+**WAL -> Parquet separation.** Append-only binary writes on the hot path,
+columnar conversion offline. The WAL absorbs burst throughput without blocking;
+Parquet provides query-friendly storage. The wire format is shared between WAL
+and future IPC, so the hot-path write is one MessagePack encode, not a
+serialize-then-reserialize chain. Proven pattern.
 
-### 3. WAL writer never calls fsync
+**WsPool sharding.** Stream deduplication (FundingRate + MarkPrice + IndexPrice
+all map to a single `@markPrice` stream), chunking by the 200-stream limit, and
+transparent multi-connection management. Scales to hundreds of instruments.
 
-`BufWriter` only flushes to OS page cache. A process crash or power loss loses
-everything in the buffer. Professional WAL implementations fsync on a
-configurable interval (e.g., every 1s or every N events).
+**Reconnection with cancellation awareness.** `reconnect_loop()` with
+exponential backoff (1s to 30s cap), full resubscription on the new connection,
+and `CancellationToken` integration in both the read loop and the backoff sleep.
+This is the most important reliability feature for unattended recording.
 
-### 4. WAL date key uses wall clock, not event timestamp
+**Clean shutdown chain.** `smoke.rs` uses `tokio::select!` with `ctrl_c()`,
+disconnects the adapter (which cancels all WsPool tasks and awaits them with a
+3s timeout), then `drop(wal)` which drops the sender, breaks the background
+thread's recv loop, flushes all `BufWriter`s, fsyncs, and joins. No data loss
+on normal shutdown.
 
-`recorder/src/lib.rs:42` — `Utc::now()` determines which file an event goes to.
-Events arriving at 23:59:59.999 UTC may end up in the wrong day's file if the
-clock ticks over. Should use `event.venue_ts` (or a designated event date).
+**WAL writer runs on a dedicated OS thread.** Not in the async runtime. Writes
+are synchronous `BufWriter::write_all` with periodic `sync_data()` every 1s.
+The channel between async and sync worlds is `mpsc::sync_channel(10_000)`.
 
-### 5. Parquet converter loads entire WAL into memory
+## What's Wrong
 
-`parquet_converter.rs:15` — `fs::read(wal_path)?` reads the whole file. Your
-architecture doc estimates 50-200 GB daily WALs. This will OOM. Need streaming
-decode.
+### Bugs
 
-### 6. Double JSON parse per WebSocket message
+**1. No initial order book snapshot (medium).** `DataType::BookDepth` maps to
+`@depth@100ms`, which emits incremental `depthUpdate` messages. The
+`BookSnapshot` payload variant exists but is never produced. Without a REST
+snapshot from `/fapi/v1/depth` as a starting point, the recorded depth updates
+are unusable for book reconstruction. This blocks any future order book feature.
 
-`handle_message` parses JSON twice — once into `WsEventType` to read the `"e"`
-field, then again into the specific message type. On the hot path at 50k msg/sec,
-this doubles your parse cost. Use `serde_json::RawValue` to extract the
-discriminant without full deserialization, or use `#[serde(tag = "e")]` on a
-single enum to parse once.
+**2. Parquet converter accumulates full day in memory (medium).** The streaming
+WAL decode is correct — frames are read one at a time. But each column collector
+(`BookTickerColumns`, `TradeColumns`, etc.) appends every row into `Vec`s, then
+writes a single `RecordBatch` per file. A full day of BookTicker data at
+production volume could be tens of millions of rows. Fix: write in batches
+(e.g., 500K rows per `RecordBatch`), which also improves Parquet row group
+compression.
 
-> **[Disagreement]** The original assessment suggested `serde_json::Value` as an
-> alternative. That would be *slower* than double parsing — `Value` heap-allocates
-> for every JSON value. `RawValue` or a `#[serde(tag = "e")]` enum are the
-> correct fixes. `Value` is not.
+**3. `markPriceUpdate` emits 3 sequential awaits (low-medium).** Three
+`sink.send().await` calls per message — mark price, index price, funding rate.
+Under backpressure, this triples latency for this event type. Not a correctness
+issue, but measurable at scale. Fix: buffer the three events locally and send as
+a batch, or use `try_send` for the second and third.
 
-### 7. No WebSocket reconnection
+**4. Instrument kind mapping is lossy (low).** `contract_type != "PERPETUAL"`
+maps to `InstrumentKind::Spot`. Binance Futures has `CURRENT_QUARTER` and
+`NEXT_QUARTER` delivery contracts — these are not spot. Fix: add
+`InstrumentKind::Future { expiry: Option<NaiveDate> }` or just
+`InstrumentKind::Delivery`.
 
-`ws_pool.rs:60-69` — the read task loop breaks on `Close` or `Err`, and nothing
-restarts it. In production, Binance connections drop every 24h minimum (their
-documented behavior), plus random disconnects. Without reconnection +
-resubscription, data collection stops silently.
+### Code Quality
 
-### 8. BookUpdate events not handled in Parquet converter
+**Read loop duplication.** `connection_task_with_reader()` and
+`reconnect_loop()` contain nearly identical 30-line read loops. A bug fix in one
+must be mirrored in the other. Extract a shared `read_loop` function that takes
+`reader`, `writer`, `sink`, `venue_id`, `seq`, `cancel` and returns when the
+connection drops or shutdown is signaled.
 
-`parquet_converter.rs:88` — `_ => {}` silently drops `BookSnapshot`, `BookUpdate`,
-and `FundingRateRealized`. These are defined in your payload enum but never
-persisted.
+**No jitter on backoff.** `ExponentialBackoff` doubles the delay deterministically.
+Multiple connections reconnecting simultaneously will all hit the same delay,
+creating thundering herd behavior. Add `rand::thread_rng().gen_range(0..=delay/4)`
+jitter.
 
-## Code Quality Issues
+**No stale connection detection.** The code handles Binance pings but doesn't
+detect stalled connections where no data arrives. A connection could silently stop
+sending without triggering Close or Error. Add a "no message received in N
+seconds" timeout that triggers reconnection.
 
-**Zero tests.** Not a single `#[test]` in any crate. For a system that handles
-money, this is the highest-priority gap. Wire encode/decode roundtripping, event
-construction, stream deduplication — all trivially testable.
+**Dead types.** `Venue` struct in `types.rs` (defined, never used anywhere).
+`ErrorPayload` / `Payload::Error` (defined, never constructed). `.env.example`
+at workspace root (empty file). These should be cleaned up.
 
-**No logging.** Not a single `tracing::info!` or `eprintln!`. When something goes
-wrong in production (and it will), you have zero observability. Add `tracing` +
-`tracing-subscriber` as a workspace dependency.
+**`WalWriter::send()` signature hides cost.** Takes `&Event` but internally
+clones. With `Arc<str>` IDs the clone is cheap for scalars, but `BookUpdate` and
+`Trades` payloads contain `Vec<Level>` / `Vec<Trade>` which are heap-allocated.
+The clone is necessary for the `mpsc` channel, but the `&Event` signature
+misleads callers about the cost. Consider taking `Event` by value and letting
+callers decide whether to clone.
 
-**Error types are incomplete.** `VenueError` and `WireError` don't implement
-`std::error::Error` or `Display`. This prevents using `?` operator with
-`anyhow`/`thiserror` and makes error messages opaque.
+### Architectural Debt
 
-**Inconsistent formatting.** Mixed indentation (2-space, 4-space, and irregular)
-across files. Run `cargo fmt` and add a `rustfmt.toml`.
+**`async_trait` on `EventSink`.** Every `send()` call goes through
+`#[async_trait]`, which generates `Box<dyn Future>`. With static dispatch
+through generics (`BinanceAdapter<S: EventSink>`), LLVM can often devirtualize
+and elide the allocation, but it's not guaranteed. Native async traits have been
+stable since Rust 1.75. Migrating removes the `async-trait` dependency, the
+heap allocation concern, and makes the generated code simpler for the optimizer.
+This isn't urgent — the overhead is small relative to JSON parsing and network
+I/O — but it should happen before the transport layer is built.
 
-**Unnecessary allocations on hot path.** `InstrumentId { value: String }` and
-`VenueId { value: String }` — every event clones these heap strings. For a known
-small set of instruments, interned strings or `Arc<str>` would eliminate clone
-costs. Even better: use a fixed-size `[u8; 16]` or enum for venue IDs since
-you'll have ~3-5 venues.
+**No configuration system.** Venues, instruments, data paths, log levels — all
+hardcoded in example code. A TOML config file parsed with `serde` is the minimal
+viable solution. This is the single biggest blocker for running the recorder
+unattended: you shouldn't need to edit Rust source to change which instruments
+are recorded.
 
-## What to Build Next (Priority Order)
+## Latency Calibration
 
-### Tier 1: Make What You Have Production-Grade
+The architecture doc estimates 20-55us internal latency (WS recv to consumer)
+with UDS, sub-10us with SHM. These are for internal event routing only.
 
-1. **`tracing` integration** — Add structured logging to every crate. Log
-   connection state changes, subscription confirmations, parse errors, sink
-   failures. This is non-negotiable infrastructure.
-2. **WebSocket reconnection with exponential backoff** — Connections will drop.
-   Implement automatic reconnection in `WsPool` with resubscription of all
-   streams on that connection. Track connection health with heartbeat monitoring.
-3. **Graceful shutdown** — Implement `Drop` for `WalWriter` (drop sender, join
-   thread, flush). Add signal handling (`SIGTERM`/`SIGINT`) to example binaries.
-   Drain queues before exit.
-4. **Tests** — Wire roundtrip tests, adapter unit tests with mock sink, WalWriter
-   write-then-read tests, Parquet converter correctness tests. Aim for the data
-   path being fully tested.
-5. **Fix the WAL** — Add periodic fsync, streaming decode for Parquet conversion,
-   event-timestamp-based date keying.
+The dominant latency is exchange wire latency. From a well-positioned cloud
+instance (AWS Tokyo for Binance), WebSocket one-way latency is typically
+1-5ms. From other regions, 10-50ms. At these timescales, internal routing of
+20-55us is ~1-5% of total — small but not irrelevant.
 
-### Tier 2: Core Missing Infrastructure
+Crypto market making operates in a different regime than equity HFT. Exchanges
+don't offer traditional colocation. Binance matching engine latency itself is
+single-digit milliseconds. Many profitable crypto market makers run on standard
+Rust/C++ stacks without FPGA or kernel bypass. The Rust + tokio stack is
+competitive for crypto — not for equity HFT, but that's not the target.
 
-6. **Configuration system** — Use `serde` + TOML config files. Venues to connect,
-   instruments to subscribe, data directory paths, transport selection, log levels.
-   Right now everything is hardcoded.
-7. **`transport` crate (UDS)** — `UdsSink` and `UdsSource` implementing
-   `EventSink`. This is what makes the multi-process architecture real. Without
-   it, everything runs in one process.
-8. **`event-bus` crate** — Central routing process. Accept connections from venue
-   processes, fan out to consumers with topic filtering. This is the backbone.
-9. **Metrics** — Instrument latency (`venue_ts` to `local_ts` gap), message rates,
-   queue depths, connection counts. Use `metrics` crate with Prometheus exporter
-   or at minimum periodic stderr dumps.
-10. **`venue-process` binary harness** — Config-driven binary that boots a
-    `VenueAdapter`, wires transport, handles signals. Eliminates the need for
-    custom `main()` per venue.
+Where this infrastructure provides real edge: **data quality and backtesting
+rigor.** Clean recorded data, deterministic replay, rapid strategy iteration.
+The WAL + Parquet + replay architecture is exactly right for this.
 
-### Tier 3: Trading Capabilities
+## Dependency Assessment
 
-11. **Order book management** — Maintain local L2 order book from `BookSnapshot` +
-    `BookUpdate` streams. This is essential for any strategy beyond basic signal
-    generation. The data structure choice here matters a lot for performance
-    (sorted vec vs. `BTreeMap` vs. custom array-backed book).
-12. **`replay` crate** — Parquet → `EventSink` with k-way merge on timestamp. Add
-    `ReplaySpeed` support. This enables backtesting.
-13. **Strategy engine trait** — Define `Strategy` trait that consumes events and
-    emits signals/orders. Keep it minimal:
-    `on_event(&mut self, event: &Event) -> Vec<Signal>`.
-14. **Execution layer** — REST/WebSocket order placement on Binance. Order
-    lifecycle tracking (new → ack → partial fill → filled). This is where real
-    complexity lives.
-15. **Risk management** — Position limits, notional limits, rate limiting, kill
-    switch. Must exist before any live trading.
+| Dependency | Used by | Notes |
+|---|---|---|
+| `async-trait` | venue-adapter, venue-binance | Should migrate to native async traits |
+| `tokio` | venue-adapter, venue-binance | Runtime; features = `full` in venue-binance |
+| `tokio-tungstenite` | venue-binance | WebSocket client, `native-tls` feature |
+| `tokio-util` | venue-binance | `CancellationToken` only |
+| `futures-util` | venue-binance | `SplitSink`, `SplitStream`, `StreamExt`, `SinkExt` |
+| `reqwest` | venue-binance | REST API (instrument fetch) |
+| `serde` + `serde_json` | venue-core, venue-binance, wire | Serialization; `rc` feature for `Arc<str>` |
+| `rmp-serde` | wire | MessagePack codec |
+| `rust_decimal` | venue-core, venue-binance | Precise price/qty representation; `serde-with-str` feature |
+| `arrow` + `parquet` | recorder | v55; Parquet output |
+| `chrono` | recorder | Date key derivation (`DateTime::from_timestamp`) |
+| `tracing` | workspace | Structured logging |
+| `tracing-subscriber` | workspace (dev) | Log output in examples |
 
-## Rust Learning Opportunities in This Codebase
+The dependency set is reasonable. `arrow` + `parquet` are heavy (~large compile
+time) but necessary. No vendored C libraries. No nightly features.
 
-Based on the code, here are the Rust patterns you'd benefit from studying deeper:
+## Roadmap
 
-- **Error handling with `thiserror`** — Replace manual error enums with
-  `#[derive(Error)]`. Learn the `From` trait for error conversion chains.
-- **Interior mutability** — `WsPool` will need `Arc<Mutex<>>` or lock-free
-  patterns when you add reconnection. Study `parking_lot` vs `std::sync`.
-- **Lifetime elision in traits** — The `EventSink` trait currently requires
-  `'static`. Study when this is necessary vs. when `&'a` bounds work.
-- **Zero-copy deserialization** — `serde_json::from_str` allocates new strings.
-  Study `#[serde(borrow)]` and `Cow<'a, str>` for the hot path.
-- **Type-state pattern** — For connection lifecycle (`Disconnected` → `Connecting`
-  → `Connected` → `Subscribed`). Prevents calling `subscribe()` before `connect()`
-  at compile time rather than runtime.
-- **Async cancellation safety** — Your `tokio::spawn` tasks need to handle
-  cancellation properly. Study `tokio::select!` and `CancellationToken`.
+### Phase 2a: Unattended Recording
+
+1. **Configuration (TOML)** — `config` crate with serde. Venues, instruments,
+   data paths, log levels. A `venue-process` binary that reads config and runs.
+2. **WAL rotation** — roll at midnight UTC (or size threshold). Auto-trigger
+   Parquet conversion of yesterday's WAL. Clean up old writers from the HashMap.
+3. **CI pipeline** — `cargo fmt --check`, `cargo clippy`, `cargo test` on push.
+4. **Extract shared read loop** — deduplicate WsPool read logic.
+5. **Add backoff jitter** and stale connection timeout.
+6. **Delete dead code** — `Venue`, `ErrorPayload`, `.env.example`.
+
+### Phase 2b: Transport & Event Bus
+
+7. **`transport` crate (UDS)** — `UdsSink` / `UdsSource` implementing
+   `EventSink` over Unix domain sockets. Makes multi-process architecture real.
+8. **Migrate off `async_trait`** — use native async traits before building new
+   `EventSink` implementations.
+9. **`event-bus` crate** — central routing with topic filtering (venue,
+   instrument, data type).
+10. **Metrics** — events/sec, `venue_ts` to `local_ts` gap, connection state,
+    queue depths. `metrics` crate with Prometheus exporter or periodic stderr.
+
+### Phase 3: Replay & Backtesting
+
+11. **Initial book snapshot via REST** — fetch `/fapi/v1/depth`, emit
+    `BookSnapshot`, then subscribe to `@depth@100ms` for updates.
+12. **`replay` crate** — Parquet -> `EventSink` with k-way merge on timestamp,
+    configurable speed (`RealTime`, `Multiplied(f64)`, `MaxThroughput`).
+13. **Local order book reconstruction** — `BookSnapshot` + `BookUpdate` stream
+    into an L2 book structure.
+14. **`Strategy` trait** — `on_event(&mut self, event: &Event) -> Vec<Signal>`.
+15. **Backtest harness** — replay -> strategy -> signal log.
+16. **Second venue (Bybit or OKX)** — validates the VenueAdapter abstraction.
+
+### Phase 4: Live Trading
+
+17. **Order placement** — Binance REST + WebSocket user data stream.
+18. **Position tracking** and order lifecycle (new -> ack -> fill).
+19. **Risk management** — position limits, rate limiting, kill switch.
+20. **Paper trading mode** — strategy emits orders, system logs but doesn't
+    send.
+
+### Not Prioritized (Do Later If Needed)
+
+- **Decimal128 in Parquet** — f64 precision loss is theoretical at current
+  crypto value ranges. Worth doing eventually, not blocking.
+- **SHM ring buffers** — Phase 2 transport. UDS first; SHM only if UDS
+  latency is measured and insufficient.
+- **Zero-copy wire format** — `EventRef<'a>` borrowing from buffer. Only
+  matters after profiling shows decode allocation as a bottleneck.
+- **`WalWriter::send()` signature change** — take `Event` by value. Minor
+  API improvement, not urgent.
+
+## Code Quality Summary
+
+| Area | State |
+|---|---|
+| Tests | 7 (6 wire roundtrip/edge-case + 1 recorder write-then-read) |
+| Formatting | `rustfmt.toml` (max_width=100, edition 2021), `cargo fmt` clean |
+| Clippy | Clean |
+| CI | None |
+| Error types | `Display` + `Error` on `VenueError`, `EventSinkError`, `WireError` |
+| Logging | `tracing` in venue-binance + recorder; `tracing-subscriber` in examples |
+| Dead code | `Venue` struct, `ErrorPayload`, `.env.example` |
 
 ## Bottom Line
 
-The architecture is sound and the design is ambitious in the right ways. The main
-gap is reliability engineering — the code has a "happy path works" quality level
-but no resilience, no observability, and no tests. For competing with professional
-shops, the data infrastructure (recording, replay, backtesting) matters more than
-low-latency execution at the start — you can't build strategies without clean
-historical data. Prioritize making the recording pipeline bulletproof, add
-reconnection, add logging, add tests. Then build toward the event-bus and replay
-system, which unlock backtesting. Execution and risk come last because they're
-dangerous without the foundation being solid.
+The foundation is sound. EventSink as the pluggability boundary, WAL + Parquet
+pipeline, process-per-venue isolation, and WsPool with reconnection are all
+correct patterns. The code has been hardened through two rounds of fixes and the
+recorder can be trusted for unattended data collection.
 
----
+The gap is between the architecture doc (which describes a complete multi-venue,
+multi-consumer system with transport layer, event bus, replay, and strategy
+engine) and the code (which is a single-venue recorder). That gap is expected
+at this stage — the important thing is that the existing code doesn't paint you
+into a corner. The EventSink abstraction means transport, bus, and replay can be
+added without modifying venue code.
 
-# Revised Assessment
-
-## Recalibrating the Previous Review
-
-The previous assessment was largely accurate on the technical details but too
-diplomatic in its framing. Here's a more honest take after a second pass.
-
-## The Real State of the Project
-
-This is ~1,060 lines of Rust across 5 crates. The architecture doc alone is 420
-lines, the README another 196. You've written more documentation about the system
-you intend to build than actual system code. That's not inherently bad — thinking
-before coding is valuable — but it means the project is at about 15% of the
-architecture it describes. The README and `docs/architecture.md` read like a
-finished system; the code is an early prototype with one venue adapter and a basic
-recording pipeline.
-
-What actually exists and works:
-
-- Binance Futures WebSocket connection with stream sharding
-- JSON deserialization for 4 message types
-- MessagePack WAL recording
-- Batch WAL-to-Parquet conversion
-- 4.3 MB of real recorded data proving the pipeline runs end-to-end
-
-What's described but doesn't exist: event bus, transport layer, UDS/SHM, replay,
-strategy engine, second/third venue, configuration system, any tests.
-
-## What the Previous Assessment Got Right
-
-The bug list is valid and I stand by all of it. The most dangerous ones:
-
-- **No WAL fsync** — a crash loses your buffer. Unacceptable for a data recording
-  system.
-- **Silent event drops** — `let _ = sink.send(...)` everywhere. You can't know if
-  you're losing data.
-- **No reconnection** — Binance kills connections after 24h. Your recorder
-  silently dies and you discover days later that you have gaps.
-- **Full WAL loaded into memory** — will OOM at production data volumes.
-
-## What the Previous Assessment Was Too Generous About
-
-**"The architecture design is strong"** — I'll revise this. The `EventSink` trait
-abstraction is a solid idea, but the execution has issues:
-
-- `EventSink` requires `Clone + 'static + Send + Sync` and is `async`. The
-  `Clone` bound means every concrete implementation needs `Arc` internally. The
-  `async` on `send()` adds overhead on the hot path (future allocation, poll
-  machinery). For a latency-sensitive system, the hot-path sink should probably be
-  synchronous — a ring buffer write or channel send, not an async call. You're
-  paying async overhead to do what is fundamentally a memcpy.
-
-> **[Disagreement]** This overstates the problem. `async send()` doesn't
-> necessarily mean heap allocation — with native async traits (stable since Rust
-> 1.75), the future is stack-allocated. The current overhead comes from
-> `async_trait`'s `Box<dyn Future>`, which is fixable by switching to native async
-> traits. More importantly, making `send()` synchronous means you lose
-> backpressure handling. A synchronous `try_send` that drops events on a full
-> channel is worse than async backpressure. The right fix is dropping
-> `async_trait`, not dropping `async`.
-
-- `connect()` is a no-op (`Ok(())`). The actual connection happens inside
-  `subscribe()`. This means the `VenueAdapter` lifecycle states (connect →
-  subscribe → disconnect) don't match reality. A caller can't distinguish
-  "connected but not subscribed" from "not connected at all."
-
-> **[Disagreement]** This is fine for a prototype. The connect/subscribe
-> separation exists to support venues that require explicit authentication before
-> subscribing (private data streams, API key handshake). Binance public market
-> data doesn't need it, so a no-op is reasonable for now. The trait contract is
-> forward-looking — it'll matter when you add authenticated feeds.
-
-- `Lifecycle` enum is dead code. It's defined in `venue-core` with 14 variants
-  but never appears in `Payload`. There's no `Payload::Lifecycle(Lifecycle)`
-  variant. The system has no way to emit connection state changes as events.
-
-**"The domain types are well-modeled"** — They're adequate, not well-modeled.
-`InstrumentId { value: String }` is a heap-allocated string with no validation, no
-normalization guarantees (you lowercase in the adapter, but nothing prevents
-constructing one with uppercase), and no interning. Every event clones this
-string. With 300 instruments at 50k events/sec, that's 50k string clones per
-second that could be zero-cost lookups into a static table or `Arc<str>`.
-
-`VenueId` is worse — you only have 3-5 venues. This should be an enum, not a heap
-string. `VenueId { value: "binance".to_string() }` allocates on every adapter
-construction and clones on every event.
-
-> **[Disagreement]** Making `VenueId` an enum couples `venue-core` to knowledge
-> of which specific venues exist. Every new venue requires modifying the core
-> crate. A better middle ground: `Arc<str>` or `&'static str`, which avoids per-
-> event allocation without coupling core types to venue implementations. The enum
-> approach sounds clean but violates the open/closed principle the architecture
-> is built on.
-
-## What the Previous Assessment Missed
-
-### 1. `markPriceUpdate` handler emits 3 events from 1 message
-
-`lib.rs:280-313` — each calls `sink.send().await` sequentially. If the sink has
-any backpressure, you're tripling latency for this message type. More
-importantly, these 3 events share the same `local_ts` but represent different
-logical timestamps — the mark price, index price, and funding rate may not have
-changed simultaneously. You're conflating "Binance batches these in one message"
-with "these events are simultaneous."
-
-> **[Disagreement]** The backpressure concern is valid, but the semantics argument
-> is wrong. Binance's `markPriceUpdate` message genuinely contains all three
-> values (mark price, index price, funding rate) sampled at the same `event_time`.
-> They *are* simultaneous from the exchange's perspective — it's a single snapshot.
-> Emitting 3 separate normalized events is the correct decomposition for an
-> event model that separates concerns. The issue is the sequential `await` (batch
-> the sends), not the semantic split.
-
-### 2. `WalWriter::send(&self, event: &Event)` clones the event
-
-`recorder/src/lib.rs:32` — every event going to the WAL gets fully cloned —
-including all the `String` fields in `InstrumentId`, the `Vec<Level>` in book
-updates, etc. The WAL writer takes `&Event` but internally does `event.clone()`
-to send across the channel. At high throughput this is a meaningful allocation
-cost. The signature lies about its overhead.
-
-### 3. The smoke example has no shutdown path
-
-`smoke.rs:30-33` loops `while let Some(event) = rx.recv().await` forever. Ctrl+C
-kills the process, the WAL `BufWriter` never flushes, last N events are lost. For
-a data collection tool, this is the normal operating mode — and it guarantees data
-loss on every run.
-
-### 4. No sequence numbers are ever assigned
-
-`sequence: None` on every event. The architecture doc discusses sequence numbers
-for gap detection, but no code ever sets them. Without sequences, you can't
-detect dropped events during replay.
-
-### 5. Parquet schema loses precision
-
-`parquet_converter.rs` converts `Decimal` to `f64` for Parquet columns. `Decimal`
-has 28-digit precision; `f64` has ~15. For prices like `67123.40000000`, this is
-fine. For quantities like `0.00000001` (1 satoshi), floating point representation
-introduces error. Professional systems store prices as fixed-point integers
-(price * 10^8) or as string/decimal128 in Parquet.
-
-> **[Disagreement]** The practical impact is overstated for crypto. All Binance
-> prices and quantities fit within f64 precision for the value ranges you'll
-> encounter. `1e-8` is exactly representable as IEEE 754 double. The real risk is
-> accumulated rounding in *calculations* (e.g., notional = price * qty), not in
-> storage of individual values. That said, using Decimal128 in Parquet costs
-> almost nothing and is the professional choice — worth doing, but not a
-> correctness bug at current scale.
-
-## Being Honest About "Competing with Market Makers"
-
-The architecture doc targets 20-55us internal latency with UDS and sub-10us with
-SHM. These numbers are for internal event routing only. The actual bottleneck is
-the exchange API wire latency: Binance WebSocket from a non-colocated server is
-50-200ms. Your 20us internal routing is irrelevant when your signal arrives 100ms
-after the exchange event.
-
-> **[Disagreement]** The 50-200ms figure is misleading. That's worst-case from
-> across the globe. From a well-positioned cloud instance (AWS Tokyo for Binance),
-> WebSocket round-trip is typically **1-10ms**. At 1-10ms wire latency, 20-55us
-> internal routing is ~1-5% of total — small, but not irrelevant.
->
-> More importantly, crypto market making is a different game than equity HFT.
-> Crypto exchanges don't offer traditional colocation. Binance's matching engine
-> latency itself is single-digit milliseconds. Many profitable crypto market
-> makers run on standard Rust/C++ stacks without FPGA. The Rust + tokio stack is
-> within striking distance for crypto market making — not competitive for equity
-> HFT, but that's not the target.
-
-Professional market making firms use:
-
-- Colocation (same datacenter as the exchange matching engine)
-- Kernel bypass networking (DPDK, `io_uring`, custom NIC drivers)
-- FPGA-based feed handlers that parse and act in single-digit microseconds
-- Lock-free data structures, no async runtime, no heap allocation on hot path
-
-The Rust + tokio + serde_json + WebSocket stack you have is fundamentally a
-different tier. That's not a criticism — it's a calibration. This stack is
-appropriate for systematic/quantitative trading at medium frequency (seconds to
-minutes holding periods), which is where retail and small fund infrastructure
-actually operates. You can build a profitable system at this tier. But calling it
-"competing with market makers" sets wrong expectations about what the latency
-engineering is actually buying you.
-
-Where this infrastructure can compete: **data quality and backtesting rigor**.
-Having clean recorded data, deterministic replay, and the ability to rapidly
-iterate on strategies — that's the edge that matters for a small operation. The
-WAL + Parquet + replay architecture is exactly right for this. Focus there.
-
-## Revised Priority List
-
-The previous list was mostly right but I'd restructure it:
-
-### Phase 1: Make recording bulletproof (this is your actual product right now)
-
-1. `tracing` — add it everywhere, you're flying blind
-2. WebSocket reconnection with exponential backoff and resubscription
-3. WAL fsync on interval, `Drop` impl for `WalWriter`, signal handling in smoke
-   example
-4. Streaming WAL decode in Parquet converter (don't load entire file)
-5. Surface send errors instead of `let _ =` — at minimum log them
-6. `cargo fmt`, fix warnings, add `clippy` to your workflow
-
-### Phase 2: Make recording run unattended
-
-7. Configuration (TOML) — venues, instruments, paths, log levels
-8. `venue-process` binary with signal handling and health reporting
-9. Assign sequence numbers for gap detection
-10. WAL rotation at midnight + automatic Parquet conversion of yesterday's WAL
-11. Basic metrics (events/sec, latency histogram, connection state)
-
-### Phase 3: Enable backtesting
-
-12. `replay` crate — Parquet → `EventSink` with timestamp ordering
-13. `Strategy` trait — `on_event(&mut self, event: &Event)`
-14. Local order book reconstruction from depth snapshots + updates
-15. Basic backtest harness that runs replay → strategy → records signals
-
-### Phase 4: Live trading
-
-16. Order placement (Binance REST + WebSocket user data stream)
-17. Position tracking
-18. Risk limits
-19. Paper trading mode (strategy emits orders, system logs but doesn't send)
-
-## Rust Patterns to Study
-
-One revision from the previous assessment: I'd add `#[inline]` and profile-guided
-optimization to the learning list. When you do get to latency optimization,
-knowing where to put `#[inline]` and how to read `perf`/`flamegraph` output
-matters more than changing data structures. Measure first, then optimize.
-
-Also study `bytes::Bytes` and `bytes::BytesMut` — these are the standard
-zero-copy buffer types in the Tokio ecosystem, and your wire format + transport
-layer should use them instead of `Vec<u8>`.
-
-## Bottom Line (Revised)
-
-The project has a clear vision and the right architectural instincts. The
-`EventSink` abstraction, WAL + Parquet pipeline, and live/replay transparency are
-all correct patterns used by real trading firms. But the gap between the
-documentation and the code is large, and the code that exists lacks the
-reliability engineering needed to trust it with real data collection. The
-immediate path forward is narrow and clear: make the recorder run 24/7 without
-data loss, add reconnection, add logging, add tests. Everything else — event bus,
-SHM transport, strategy engine — is premature until you can reliably record a
-week of data without intervention. That reliable recorder is the foundation
-everything else depends on.
+Next priority: configuration system, WAL rotation, and CI. These are
+infrastructure that make the recorder production-ready. After that: transport
+(UDS) and event bus, which make the multi-process architecture real. Then
+replay, which unlocks backtesting.
