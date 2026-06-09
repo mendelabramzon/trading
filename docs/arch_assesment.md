@@ -3,6 +3,11 @@
 *Assessed against code as of 2026-06-08. ~1,771 lines of Rust across 5 crates,
 ~133 lines of examples, 4.3 MB of recorded Binance data.*
 
+*Revised 2026-06-09: added a data-model audit pass — the parsed Binance wire
+fields were checked against what actually reaches the WAL and Parquet — and this
+document's own claims were reconciled against `cargo clippy` / `cargo test`. New
+findings are tagged "new".*
+
 ## Current State
 
 Five crates form a working single-venue data collection pipeline: Binance
@@ -65,7 +70,73 @@ on normal shutdown.
 are synchronous `BufWriter::write_all` with periodic `sync_data()` every 1s.
 The channel between async and sync worlds is `mpsc::sync_channel(10_000)`.
 
+**Backpressure is genuinely lossless (new).** `SyncSender::send` blocks when the
+channel is full and only errors on disconnect, so a slow disk propagates back
+through the WAL channel -> the venue `mpsc` -> `sink.send().await` -> the WS read
+task. No silent drops on the happy path. Trade-off: a stalled disk stalls WS
+reads and can get the connection dropped by the venue for slow consumption, and
+there is no lossy/gap-detected alternative yet for latency-sensitive consumers.
+(The `WalWriter::send` "channel full or closed" log is slightly misleading —
+`send` never returns an error for "full".)
+
+**Aggressor-side mapping is correct (new).** `aggTrade.m` (buyer-is-maker) maps
+to `AggressorSide::Sell` — right, and a commonly inverted detail.
+
 ## What's Wrong
+
+### Data Integrity (high) — new in this revision
+
+The findings that matter most: they silently degrade the recorded data for its
+stated downstream purpose (replay, book reconstruction, gap detection), and
+several are *retroactively unfixable* — data recorded today without these fields
+can never be repaired.
+
+**D1. Depth updates discard `U` / `u` / `pu` — recorded book data is
+unreconstructable.** `DepthUpdateMsg` (`venue-binance/src/lib.rs`) parses only
+`s, E, b, a`. Binance USD-M diff-depth also carries `U` (first update id), `u`
+(final update id), and `pu` (previous final update id) — the only fields that
+prove a diff applies contiguously on top of a REST snapshot. They are dropped at
+parse time, so they never reach the WAL or Parquet. This is upstream of Bug 1
+below: even *with* a snapshot, an L2 book cannot be correctly reconstructed from
+this data. Blocks the entire replay/backtest roadmap and cannot be fixed after
+the fact.
+
+**D2. No venue sequence/trade IDs — the `sequence` field gives no gap
+detection.** `sequence` is a single `Arc<AtomicU64>` shared across all WS
+connections, `fetch_add(Relaxed)` at emit time. It is monotonic by construction,
+so it can never reveal a message the venue dropped, says nothing about
+per-instrument ordering, and `markPriceUpdate` burns three values per message.
+The fields that *would* enable gap detection — `aggTrade.a`, depth `U`/`u`,
+bookTicker `u` — are discarded. As recorded, "sequence" is a global emit counter
+with near-zero data-quality value. (Round 2 framed this as a reliability win; it
+is not one.)
+
+**D3. Parquet is not sorted by `venue_ts`, which breaks the documented replay
+design.** `architecture.md` states replay does a k-way merge on `venue_ts`
+"already sorted by timestamp within each file." It is not: N WS connections fan
+into one `mpsc` -> one WAL in *arrival* order, and `venue_ts` is only
+millisecond-resolution from Binance, so interleaving and ties are guaranteed.
+Either the recorder orders per file on write (needs buffering) or replay must
+sort (unbudgeted memory). Decide the sort contract before replay is built.
+
+**D4. `level_idx` is recorded for depth *updates*, implying order that does not
+exist.** `BookDepthColumns::push_levels` assigns `level_idx` by array position
+and is reused for both `BookSnapshot` and `BookUpdate`. For a snapshot that is
+meaningful; for a diff update the array is an unordered set of changes, so
+`level_idx` misleads any consumer.
+
+**D5. `Decimal -> f64` failures silently become `0.0`.** Every
+`.to_f64().unwrap_or(0.0)` in `parquet_converter.rs` turns a conversion failure
+into a plausible-looking zero price/qty, with no log — silent corruption, worse
+than the f64 precision loss noted below. Log and drop (or carry null) instead.
+
+**D6. WAL has no header/version/magic/CRC, and readers hard-stop on the first
+bad frame.** `read_wal` and `convert_wal` break/return on the first decode error,
+so one torn frame (crash mid-write, bad sector) silently truncates the rest of
+that day with no resync. There is also no schema-version tag: any reorder of the
+`Payload` enum makes every historical WAL undecodable. Add a frame magic +
+version + length + CRC and skip-to-next-frame recovery before trusting this for
+24/7 capture.
 
 ### Bugs
 
@@ -74,14 +145,17 @@ The channel between async and sync worlds is `mpsc::sync_channel(10_000)`.
 `BookSnapshot` payload variant exists but is never produced. Without a REST
 snapshot from `/fapi/v1/depth` as a starting point, the recorded depth updates
 are unusable for book reconstruction. This blocks any future order book feature.
+Necessary but not sufficient — see D1: the update IDs needed to splice a snapshot
+onto the diff stream are also being dropped.
 
 **2. Parquet converter accumulates full day in memory (medium).** The streaming
 WAL decode is correct — frames are read one at a time. But each column collector
 (`BookTickerColumns`, `TradeColumns`, etc.) appends every row into `Vec`s, then
 writes a single `RecordBatch` per file. A full day of BookTicker data at
-production volume could be tens of millions of rows. Fix: write in batches
-(e.g., 500K rows per `RecordBatch`), which also improves Parquet row group
-compression.
+production volume could be tens of millions of rows. The writers then `.clone()`
+every column `Vec` to build the Arrow arrays, doubling peak memory at write time.
+Fix: write in batches (e.g., 500K rows per `RecordBatch`), which also improves
+Parquet row group compression.
 
 **3. `markPriceUpdate` emits 3 sequential awaits (low-medium).** Three
 `sink.send().await` calls per message — mark price, index price, funding rate.
@@ -112,6 +186,36 @@ jitter.
 detect stalled connections where no data arrives. A connection could silently stop
 sending without triggering Close or Error. Add a "no message received in N
 seconds" timeout that triggers reconnection.
+
+**No SUBSCRIBE-ack validation (new).** `subscribe()` / `reconnect_loop()` send the
+SUBSCRIBE frame and never read Binance's `{"result":null,"id":...}` response. A
+rejected resubscribe (bad stream, rate limit) leaves a connection that is "up"
+but receiving nothing, indefinitely — and with no stale-connection timeout
+(above) nothing recovers it.
+
+**Reconnect backs off before the first retry (new).** `reconnect_loop` calls
+`next_delay()` at the top of the loop, so every reconnect — even a transient
+blip — eats >=1s of guaranteed data gap. Attempt immediately, then back off only
+on failure.
+
+**`connect()` is a no-op (new).** The real TCP connect is lazy inside
+`subscribe()`; `connect()` just returns `Ok(())`. The trait's connect->subscribe
+lifecycle is misleading, and a second venue or the planned `venue-process`
+harness may reasonably assume `connect()` establishes a session.
+
+**WAL writers are never rotated or evicted (new).** `writers: HashMap<venue/date,
+...>` only ever inserts; old-day entries are never closed, so file descriptors
+accumulate over a multi-day run and every 1s fsync loop flushes all of them.
+`architecture.md` says files roll "at midnight UTC or size threshold" — neither
+exists; rotation is only an emergent side-effect of the event-derived date key
+changing. Late events for a prior date (clock skew, reconnect) also reopen and
+append to old-day files.
+
+**`WalWriter` does not implement `EventSink` (new).** The README headline —
+recorder/strategies/bus "all produce or consume the same `Event` type" via
+`EventSink` — is not yet true. `WalWriter::send(&Event)` is an inherent,
+synchronous method, and `smoke.rs` manually bridges `rx.recv()` -> `wal.send()`.
+The uniform-sink story is aspirational until the recorder implements the trait.
 
 **Dead types.** `Venue` struct in `types.rs` (defined, never used anywhere).
 `ErrorPayload` / `Payload::Error` (defined, never constructed). `.env.example`
@@ -184,6 +288,22 @@ time) but necessary. No vendored C libraries. No nightly features.
 
 ## Roadmap
 
+### Phase 0: Data-Model Fixes (before recording more data) — new
+
+These gate everything downstream and several are retroactively unfixable, so they
+come before the infrastructure work below.
+
+0a. **Capture venue identity fields** — depth `U`/`u`/`pu`, `aggTrade.a`,
+    bookTicker `u`. Thread them through the payloads, wire format, and Parquet
+    schemas. (Fixes D1, D2.)
+0b. **Decide the Parquet sort contract** — order events per file on write, or
+    specify that replay must sort. (Fixes D3.)
+0c. **WAL framing** — magic + version + length + CRC per frame, with
+    skip-to-next-frame recovery on decode error. (Fixes D6.)
+0d. **Stop silently zeroing `Decimal -> f64` failures** — log and drop or null;
+    reconsider Decimal128/string storage at the same time (see "Not
+    Prioritized"). (Fixes D5.)
+
 ### Phase 2a: Unattended Recording
 
 1. **Configuration (TOML)** — `config` crate with serde. Venues, instruments,
@@ -243,27 +363,32 @@ time) but necessary. No vendored C libraries. No nightly features.
 |---|---|
 | Tests | 7 (6 wire roundtrip/edge-case + 1 recorder write-then-read) |
 | Formatting | `rustfmt.toml` (max_width=100, edition 2021), `cargo fmt` clean |
-| Clippy | Clean |
+| Clippy | Clean for `cargo clippy` (lib only); `--all-targets` emits 2 warnings: unnecessary `i as u64` cast (recorder test), unused `EventSink` import (fetch_instruments example) |
 | CI | None |
 | Error types | `Display` + `Error` on `VenueError`, `EventSinkError`, `WireError` |
 | Logging | `tracing` in venue-binance + recorder; `tracing-subscriber` in examples |
 | Dead code | `Venue` struct, `ErrorPayload`, `.env.example` |
+| Doc drift | `architecture.md` shows stale `wire` signatures (`encode -> usize`, `decode -> Result<Event>`); `report_phase1.md` says architecture.md "still mentions bincode" (it no longer does) |
 
 ## Bottom Line
 
-The foundation is sound. EventSink as the pluggability boundary, WAL + Parquet
-pipeline, process-per-venue isolation, and WsPool with reconnection are all
-correct patterns. The code has been hardened through two rounds of fixes and the
-recorder can be trusted for unattended data collection.
+Structurally the foundation is sound: EventSink as the pluggability boundary, the
+WAL + Parquet pipeline, process-per-venue isolation, and WsPool with reconnection
+are all correct patterns, and the recorder's write path is genuinely lossless.
 
-The gap is between the architecture doc (which describes a complete multi-venue,
-multi-consumer system with transport layer, event bus, replay, and strategy
-engine) and the code (which is a single-venue recorder). That gap is expected
-at this stage — the important thing is that the existing code doesn't paint you
-into a corner. The EventSink abstraction means transport, bus, and replay can be
-added without modifying venue code.
+The real risk is not the architecture — it is the **data model**. Findings D1-D4
+mean the depth and sequencing data being recorded today cannot do what the
+replay/backtest roadmap needs, and that stays invisible until someone tries to
+reconstruct a book in a later phase and finds the update IDs were never captured.
+Unlike configuration, CI, and rotation — recoverable at any time — missing venue
+fields and un-framed WAL data are *retroactively unfixable*.
 
-Next priority: configuration system, WAL rotation, and CI. These are
-infrastructure that make the recorder production-ready. After that: transport
-(UDS) and event bus, which make the multi-process architecture real. Then
-replay, which unlocks backtesting.
+The gap between the architecture doc (a complete multi-venue, multi-consumer
+system) and the code (a single-venue recorder) is expected at this stage, and the
+EventSink abstraction does mean transport, bus, and replay can be added without
+modifying venue code — that part of the original assessment holds.
+
+Revised priority order: **(1)** capture venue update/trade IDs and frame the WAL
+(Phase 0) before recording more data; **(2)** fix the silent `0.0` corruption;
+**(3)** the original infrastructure track — configuration, CI, WAL rotation;
+**(4)** transport (UDS), event bus, and replay.
