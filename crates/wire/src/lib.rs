@@ -49,6 +49,62 @@ pub fn decode(buf: &[u8]) -> Result<(Event, usize), WireError> {
 }
 
 #[cfg(test)]
+mod encoding_probe {
+    use serde::{Deserialize, Serialize};
+
+    #[derive(Serialize, Deserialize, Debug)]
+    enum E {
+        A { x: u32, y: u32 },
+        B { x: u32, y: u32 },
+    }
+
+    #[derive(Serialize, Deserialize, Debug)]
+    struct S {
+        a: u32,
+        b: u32,
+    }
+
+    // Mirror of S with fields swapped — same wire bytes iff structs are positional.
+    #[derive(Serialize, Deserialize, Debug)]
+    struct SSwapped {
+        b: u32,
+        a: u32,
+    }
+
+    // Mirror of E with variants reordered — decode succeeds iff variants are by name.
+    #[derive(Serialize, Deserialize, Debug)]
+    enum EReordered {
+        B { x: u32, y: u32 },
+        A { x: u32, y: u32 },
+    }
+
+    #[test]
+    fn probe_rmp_serde_layout() {
+        // 1. How is an enum variant tagged? Serialize B (index 1).
+        let b = rmp_serde::to_vec(&E::B { x: 7, y: 9 }).unwrap();
+        eprintln!("PROBE enum B bytes = {b:02x?}");
+        // If by-name: should contain the ASCII "B" (0x42). If by-index: contains 0x01.
+        eprintln!("PROBE contains 'B'(0x42)={}", b.contains(&0x42u8));
+
+        // 2. Does decoding into a variant-reordered enum still yield B?
+        let decoded: EReordered = rmp_serde::from_slice(&b).unwrap();
+        eprintln!("PROBE reordered decode = {decoded:?}");
+
+        // 3. Struct field layout: positional tuple or named map?
+        let s = rmp_serde::to_vec(&S { a: 1, b: 2 }).unwrap();
+        eprintln!("PROBE struct S bytes = {s:02x?}");
+        eprintln!(
+            "PROBE contains 'a'(0x61)={} 'b'(0x62)={}",
+            s.contains(&0x61u8),
+            s.contains(&0x62u8)
+        );
+        // Decode S bytes into a field-swapped struct; if positional, a/b silently swap.
+        let swapped: SSwapped = rmp_serde::from_slice(&s).unwrap();
+        eprintln!("PROBE field-swapped decode = {swapped:?} (a=2,b=1 ⇒ positional)");
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use rust_decimal_macros::dec;

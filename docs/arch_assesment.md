@@ -8,6 +8,26 @@ fields were checked against what actually reaches the WAL and Parquet — and th
 document's own claims were reconciled against `cargo clippy` / `cargo test`. New
 findings are tagged "new".*
 
+*Remediation planning 2026-06-09: a full implementation plan for the entire "What's
+Wrong" section plus Phase 0 has been designed and recorded in
+[`improvement_plan.md`](improvement_plan.md). Key decisions: (D3) **replay sorts** —
+Parquet files stay arrival-ordered and replay does the k-way merge + in-file sort,
+letting the converter stream in 500K-row batches; (Bug 1) the recorder emits a REST
+`/fapi/v1/depth` snapshot only, leaving book reconstruction to replay; (async_trait)
+migrate `EventSink`/`VenueAdapter` to native RPITIT now; (WAL) the new framed format
+supersedes the existing ~4.3 MB of recordings, which are unreconstructable anyway.
+Nothing below is implemented yet — the items remain open.*
+
+*Reviewed 2026-06-09 (post-planning review pass, verified against source +
+`rmp-serde` 1.3.1 internals + an encoding probe): D6's failure mode refined (field
+add/remove fails **loud**, only same-arity reorders are silent — but the planned
+self-healing reader turns loud schema errors into silent whole-file skips, so the
+version byte still gates everything); D3's tie-break corrected (`sequence` is not a
+valid in-file tie-break); added **D7** — `venue_ts` mixes Binance event time and
+transaction time across streams, and depth `T` is dropped (same retroactively
+unfixable class as D1/D2); Bug 1 amended — the snapshot must be re-fetched on every
+reconnect, or one mid-day disconnect makes the rest of the day unreconstructable.*
+
 ## Current State
 
 Five crates form a working single-venue data collection pipeline: Binance
@@ -116,8 +136,17 @@ design.** `architecture.md` states replay does a k-way merge on `venue_ts`
 "already sorted by timestamp within each file." It is not: N WS connections fan
 into one `mpsc` -> one WAL in *arrival* order, and `venue_ts` is only
 millisecond-resolution from Binance, so interleaving and ties are guaranteed.
-Either the recorder orders per file on write (needs buffering) or replay must
-sort (unbudgeted memory). Decide the sort contract before replay is built.
+**Decision (2026-06-09): the contract is *replay sorts*** — recorded files stay in
+arrival order; replay performs the k-way merge across files plus an in-file sort.
+This keeps the hot path untouched and lets the converter stream in bounded 500K-row
+batches (also addressing Bug 2). `architecture.md` is to be corrected to drop the
+"already sorted within each file" claim. *Review correction (2026-06-09): the
+tie-break must be `(venue_ts, local_ts, in-file position)`, **not** `sequence` —
+`sequence` resets to 0 on process restart while same-day WAL files are reopened in
+append mode (one file can span several runs, so the counter is neither unique nor
+monotonic within a file), and it is assigned at `fetch_add` an await *before* the
+channel send, so under contention two connections' events can land in the WAL in
+the opposite order of their sequence numbers.*
 
 **D4. `level_idx` is recorded for depth *updates*, implying order that does not
 exist.** `BookDepthColumns::push_levels` assigns `level_idx` by array position
@@ -133,12 +162,36 @@ than the f64 precision loss noted below. Log and drop (or carry null) instead.
 **D6. WAL has no header/version/magic/CRC, and readers hard-stop on the first
 bad frame.** `read_wal` and `convert_wal` break/return on the first decode error,
 so one torn frame (crash mid-write, bad sector) silently truncates the rest of
-that day with no resync. There is also no schema-version tag: any reorder of the
-`Payload` enum makes every historical WAL undecodable. Add a frame magic +
-version + length + CRC and skip-to-next-frame recovery before trusting this for
+that day with no resync. There is also no schema-version tag. *Correction (2026-06-09):* `rmp-serde` encodes
+structs as **positional tuples** and enum variants **by name**, so reordering
+`Payload` / `MarketDataPayload` *variants* is actually safe — the real risk is struct
+*field* layout changes (exactly what D1/D2 do). *Review refinement (2026-06-09,
+verified against rmp-serde 1.3.1 source + probe:* `crates/wire/src/lib.rs`
+`encoding_probe`*): the two cases fail differently. Reordering **same-arity** fields
+decodes silently into the wrong fields (`{a:1,b:2}` → `{b:1,a:2}`, no error) —
+silent corruption. Adding or removing a field fails **loud** (`LengthMismatch` /
+"invalid length"), *but* once readers self-heal (skip-to-next-frame, below), an
+unversioned field addition makes every pre-change frame fail decode and get skipped
+as "corruption" — i.e. silent loss of entire files. Both halves therefore still
+require a version byte that pins the positional field layout (bump on any field
+add/remove/reorder or variant rename).* Add a frame magic + version + length + CRC (the CRC covering
+version+length+payload, plus a decode-time max-frame-length cap so a corrupted length
+can't trigger a huge read) and skip-to-next-frame recovery before trusting this for
 24/7 capture.
 
-### Bugs
+**D7. `venue_ts` mixes event time and transaction time across streams — new
+(review 2026-06-09).** aggTrade and bookTicker stamp `venue_ts` from Binance `T`
+(trade/transaction time), but depthUpdate uses `E` (event time) and drops `T`
+entirely (`DepthUpdateMsg` parses only `E`; futures depthUpdate carries both).
+Exchange-internal delay (E−T, typically 0–5 ms) therefore systematically skews
+depth events *later* than the trades produced by the same matching-engine activity
+in any venue_ts-ordered merge — exactly the cross-stream ordering replay depends
+on, and at bookTicker/trade inter-event spacing this skew is not noise. Depth `T`
+is in the same retroactively-unfixable class as D1/D2: capture it in the same
+schema change, settle on **venue_ts = transaction time** uniformly, and document
+the contract. (Capturing `E` *additionally* is cheap and equally unrecoverable
+later; it is what separates network delay from exchange-internal delay in
+`local_ts − venue_ts` data-quality metrics. Optional.)
 
 **1. No initial order book snapshot (medium).** `DataType::BookDepth` maps to
 `@depth@100ms`, which emits incremental `depthUpdate` messages. The
@@ -146,7 +199,14 @@ version + length + CRC and skip-to-next-frame recovery before trusting this for
 snapshot from `/fapi/v1/depth` as a starting point, the recorded depth updates
 are unusable for book reconstruction. This blocks any future order book feature.
 Necessary but not sufficient — see D1: the update IDs needed to splice a snapshot
-onto the diff stream are also being dropped.
+onto the diff stream are also being dropped. *Review amendment (2026-06-09): the
+snapshot **lifecycle** matters as much as the initial fetch. (a) Every reconnect
+breaks the `pu` chain, so a snapshot must be re-fetched per (re)connection — and
+ideally periodically — or one mid-day disconnect leaves the book unreconstructable
+for the rest of the day. (b) The fetch must land *inside* the live diff stream:
+fetch after the first depthUpdate for the symbol arrives (or validate against the
+first stream `U` and refetch), else `lastUpdateId` can predate the stream and the
+splice condition `U <= lastUpdateId <= u` is never satisfiable.*
 
 **2. Parquet converter accumulates full day in memory (medium).** The streaming
 WAL decode is correct — frames are read one at a time. But each column collector
@@ -216,6 +276,11 @@ recorder/strategies/bus "all produce or consume the same `Event` type" via
 `EventSink` — is not yet true. `WalWriter::send(&Event)` is an inherent,
 synchronous method, and `smoke.rs` manually bridges `rx.recv()` -> `wal.send()`.
 The uniform-sink story is aspirational until the recorder implements the trait.
+*Planning note (2026-06-09):* the planned fix splits a cloneable `WalSink` (holds the
+`SyncSender`, implements `EventSink`) from `WalWriter` (owns the writer thread, joins on
+`Drop`). Since the thread exits only once **all** senders drop, the entrypoint must
+release the adapter (which holds the sink clones) **before** `drop(wal)`, or the join
+deadlocks.
 
 **Dead types.** `Venue` struct in `types.rs` (defined, never used anywhere).
 `ErrorPayload` / `Payload::Error` (defined, never constructed). `.env.example`
@@ -293,9 +358,13 @@ time) but necessary. No vendored C libraries. No nightly features.
 These gate everything downstream and several are retroactively unfixable, so they
 come before the infrastructure work below.
 
-0a. **Capture venue identity fields** — depth `U`/`u`/`pu`, `aggTrade.a`,
-    bookTicker `u`. Thread them through the payloads, wire format, and Parquet
-    schemas. (Fixes D1, D2.)
+*Note (2026-06-09): Phase 0 is fully subsumed by Data Integrity D1–D6 — 0a = D1+D2,
+0b = D3, 0c = D6, 0d = D5 — so there is no separate Phase 0 work item; it is delivered
+via the D-fixes (plus D4). See [`improvement_plan.md`](improvement_plan.md).*
+
+0a. **Capture venue identity fields** — depth `U`/`u`/`pu` (+ depth `T`, see D7),
+    `aggTrade.a`, bookTicker `u`. Thread them through the payloads, wire format,
+    and Parquet schemas. (Fixes D1, D2, D7.)
 0b. **Decide the Parquet sort contract** — order events per file on write, or
     specify that replay must sort. (Fixes D3.)
 0c. **WAL framing** — magic + version + length + CRC per frame, with
