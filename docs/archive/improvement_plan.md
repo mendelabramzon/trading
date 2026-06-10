@@ -1,6 +1,12 @@
 # Remediation Plan — "What's Wrong" + Phase 0
 
-*Companion to [`arch_assesment.md`](arch_assesment.md). Authored 2026-06-09 as the
+> **Archived 2026-06-10.** Frozen historical record — steps 1–10 shipped as the
+> Phase-0 wire-v1 re-cut (STATUS below); the step-11 remainder (config,
+> `venue-process`, automation) moved to Phase 1 of
+> [`report-fable-10062026.md`](../report-fable-10062026.md) §7. The load-bearing
+> contracts were promoted into [`architecture.md`](../architecture.md).
+
+*Companion to [`arch_assessment.md`](arch_assessment.md). Authored 2026-06-09 as the
 implementation plan for the entire **What's Wrong** section (Data Integrity D1–D6,
 Bugs 1–4, Code Quality, Architectural Debt) plus **Phase 0**.*
 
@@ -10,7 +16,7 @@ Bugs 1–4, Code Quality, Architectural Debt) plus **Phase 0**.*
 ## STATUS — implemented 2026-06-10 (steps 1–10 + report riders)
 
 **Steps 1–10 are implemented, tested and live-verified** as the Phase-0
-wire-v1 freeze of [`report-fable-10062026.md`](report-fable-10062026.md) §7,
+wire-v1 freeze of [`report-fable-10062026.md`](../report-fable-10062026.md) §7,
 with these amendments shipped in the same re-cut:
 
 - **R1**: `Payload` is domain-namespaced (`Market/Reference/Chain/Account/Control`)
@@ -66,8 +72,9 @@ and an unattended, config-driven entrypoint.
    and sorts within a file. Document in `architecture.md`. Do **not** sort on write.
    In-file tie-break: **`(venue_ts, local_ts, in-file position)` — not `sequence`**.
    `sequence` resets per process run while same-day WAL files are append-reopened
-   (one file spans several runs ⇒ duplicates), and it is assigned at `fetch_add` an
-   await *before* the channel send, so in-file order can locally disagree with it.
+   (one file spans several runs ⇒ duplicates), and it is assigned at `fetch_add`
+   time, an await *before* the channel send, so in-file order can locally disagree
+   with it.
 2. **Bug 1 = emit snapshot only.** REST `/fapi/v1/depth` → `BookSnapshot{…,last_update_id}`
    on BookDepth subscribe. No live splice (that stays Phase 3).
 3. **async_trait → native RPITIT now**, dropping the `async-trait` dep.
@@ -98,7 +105,7 @@ and an unattended, config-driven entrypoint.
 ### Review deltas (2026-06-09)
 
 Found by checking the plan against the code and Binance USD-M semantics; this file
-is untracked, so the list doubles as the change record:
+was untracked at the time, so the list doubled as the change record:
 
 1. **Step 9 rewritten — snapshot lifecycle.** Snapshot-on-subscribe-only fails D1's
    goal on the first mid-day reconnect (broken `pu` chain, no fresh snapshot ⇒ book
@@ -330,7 +337,7 @@ Everything here shares the positional msgpack layout, so it lands together.
     (magic/version/len/CRC) and that midnight rotation now exists; the BookUpdate
     Parquet schema row is also stale (shows nested `bids[{price,qty}]`, actual is
     exploded level rows).
-  - `docs/arch_assesment.md`: mark D1–D7 and Bugs 1–4 resolved; update Code-Quality
+  - `docs/arch_assessment.md`: mark D1–D7 and Bugs 1–4 resolved; update Code-Quality
     items, "Current State"/LOC, Code Quality Summary (test counts, dead code,
     clippy), Dependency table (+`crc32fast`,`rand`,`toml`,`config` crate; −`async-trait`);
     remove the Phase 0 section (done) and completed Phase 2a items; refresh the

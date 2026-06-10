@@ -131,4 +131,4 @@ cargo run -p recorder --example convert_wal data/wal/binance/<date>.wal data/par
 
 - [docs/architecture.md](docs/architecture.md) — contracts: schema freeze rules, timestamp semantics, reader recovery, converter schemas
 - [docs/report-fable-10062026.md](docs/report-fable-10062026.md) — target architecture and phased roadmap (R1–R12)
-- [docs/improvement_plan.md](docs/improvement_plan.md) — the implemented Phase-0 remediation, with as-built amendments
+- [docs/archive/improvement_plan.md](docs/archive/improvement_plan.md) — the implemented Phase-0 remediation, with as-built amendments (archived)

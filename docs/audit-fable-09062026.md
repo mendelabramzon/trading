@@ -2,7 +2,7 @@
 
 *Auditor: Fable (Claude Code). Scope: full read of all 5 crates (1,827 LOC including
 the uncommitted `encoding_probe` module), all 4 examples, `README.md`,
-`docs/architecture.md`, `docs/arch_assesment.md`, `docs/report_phase1.md`, and
+`docs/architecture.md`, `docs/arch_assessment.md`, `docs/report_phase1.md`, and
 `docs/improvement_plan.md`. Method: every load-bearing prior claim was re-verified
 against source and toolchain — `cargo clippy --all-targets`, `cargo test`, grep
 audits for dead code and `dyn` usage, a byte-level decode of the real recorded WAL,
@@ -121,9 +121,11 @@ plan step 11).
 - `report_phase1.md`: "The recorder can now be trusted for unattended 24/7 data
   collection" is contradicted by the assessment's own later findings (no rotation,
   D1–D7) — soften or annotate; "proven with real data" holds only for
-  bookTicker/aggTrade (see N7).
+  bookTicker/aggTrade (see N7). *(Annotated as advised, then deleted 2026-06-10 —
+  fully superseded; recoverable from git history.)*
 - `arch_assesment.md`: filename typo ("assesment") — two docs link to it; rename
-  only if you accept the link churn.
+  only if you accept the link churn. *(Renamed to `arch_assessment.md`, all links
+  updated, 2026-06-10.)*
 
 ---
 

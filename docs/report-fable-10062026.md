@@ -6,8 +6,9 @@ re-verified 2026-06-10 (`cargo test`: 8/8 pass; `cargo clippy --all-targets`: th
 known warnings; the 4.5 MB WAL and single `book_ticker.parquet` match prior audits).*
 
 *Relationship to prior documents. This repo already carries an unusually complete
-audit trail: `arch_assesment.md` (D1–D7, Bugs 1–4), `improvement_plan.md` (the
-accepted 11-step remediation), `audit-fable-09062026.md` (DOC*/N*/P*), and
+audit trail: `archive/arch_assessment.md` (D1–D7, Bugs 1–4),
+`archive/improvement_plan.md` (the accepted 11-step remediation),
+`audit-fable-09062026.md` (DOC*/N*/P*), and
 `architecture-audit-fable.md` (A1–A18, funding-arb fitness). None of those findings
 are re-litigated here; they are referenced by ID and assumed accepted. This report
 answers a broader question those documents did not: **is this the right foundation
@@ -72,6 +73,10 @@ venue. Conversely, the latency roadmap (SHM, zero-copy) stays frozen (A1).
 ---
 
 ## 2. Current state (verified 2026-06-10)
+
+*Snapshot of the codebase as read for this report — i.e. **pre-Phase-0**; the
+re-cut landed later the same day (see the §7 Phase-0 exit note). The counts and
+gaps below are the historical baseline, not the current tree.*
 
 | Crate | LOC | Tests | Role |
 |---|---|---|---|
@@ -231,7 +236,7 @@ merge clock, A7 control replay). Affirmations and additions:
   Chrony + `local_ts − venue_ts` monitoring make `local_ts` trustworthy.
 - **QA-gated inputs**: replay refuses (or loudly flags) date ranges whose manifest
   rows lack a passing QA status (R10). A backtest on unaudited data is a rumor.
-- **R6 — the economics layer is missing from all plans.** For funding arb the
+- **R8 — the economics layer is missing from all plans.** For funding arb the
   backtest needs, beyond replay: (a) a **funding accrual simulator** — positions ×
   realized funding events, validated against REST history; (b) a **fee model**
   from the reference SCD (maker/taker tiers, per venue); (c) a **fill simulator**
@@ -288,7 +293,7 @@ expected window — the strategy's own SLO); daily QA report emitted by conversi
 (coverage %, gap count, dup count, `E−T` and `local−venue` latency distributions)
 written into the manifest (R10).
 
-**R16-class addition (folded into R10/R11):** make the venue process the unit of
+**Additional ops finding (folded into R10/R11):** make the venue process the unit of
 supervision — systemd units with restart policies, a health endpoint, chrony as a
 deploy prerequisite, disk-headroom alarms. None of this is novel; all of it is the
 actual hard part of "we captured everything, 24/7, on 10 venues."

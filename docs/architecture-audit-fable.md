@@ -5,7 +5,7 @@
 funding-rate arbitrage on perpetual futures across many CEX and DEX venues, many
 instruments** — and cross-checked against the current source of all five crates.*
 
-*Relationship to prior documents: `arch_assesment.md` (D1–D6, Bugs 1–4),
+*Relationship to prior documents: `arch_assessment.md` (D1–D6, Bugs 1–4),
 `improvement_plan.md`, and `audit-fable-09062026.md` (DOC*/N*/P*) cover
 code-level data integrity and are **not re-litigated** here. This audit asks a
 different question: assuming the remediation plan lands cleanly, is this the
@@ -47,7 +47,9 @@ spend Phase 2 on completeness, symbology, and funding semantics instead.**
 
 ## 2. The lens: what mid-freq funding arb actually requires
 
-Requirements derived from the strategy, used as the grading rubric:
+Requirements derived from the strategy, used as the grading rubric *(these
+R-numbers are rubric-local to this audit; the later `report-fable-10062026.md`
+reuses `R*` for its own findings)*:
 
 - **R1 — Funding data is the product.** Every predicted and realized funding
   event, for every perp on every venue, with the venue's interval and clamp

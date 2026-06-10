@@ -1,5 +1,10 @@
 # Architecture Assessment
 
+> **Archived 2026-06-10.** Frozen historical record — every finding (D1–D7,
+> Bugs 1–4, code quality) was resolved by the Phase-0 re-cut; dispositions in
+> the RESOLVED table below. Living contracts: [`architecture.md`](../architecture.md);
+> target architecture and roadmap: [`report-fable-10062026.md`](../report-fable-10062026.md).
+
 *Assessed against code as of 2026-06-08. ~1,771 lines of Rust across 5 crates,
 ~133 lines of examples, 4.3 MB of recorded Binance data.*
 
@@ -168,9 +173,9 @@ batches (also addressing Bug 2). `architecture.md` is to be corrected to drop th
 tie-break must be `(venue_ts, local_ts, in-file position)`, **not** `sequence` —
 `sequence` resets to 0 on process restart while same-day WAL files are reopened in
 append mode (one file can span several runs, so the counter is neither unique nor
-monotonic within a file), and it is assigned at `fetch_add` an await *before* the
-channel send, so under contention two connections' events can land in the WAL in
-the opposite order of their sequence numbers.*
+monotonic within a file), and it is assigned at `fetch_add` time, an await *before*
+the channel send, so under contention two connections' events can land in the WAL
+in the opposite order of their sequence numbers.*
 
 **D4. `level_idx` is recorded for depth *updates*, implying order that does not
 exist.** `BookDepthColumns::push_levels` assigns `level_idx` by array position

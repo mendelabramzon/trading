@@ -53,15 +53,10 @@ build (Phase 2), `bus`/`transport` (Phase 3, or `iceoryx2`), `replay` (Phase 4),
 ### Dependency graph (actual)
 
 ```
-venue-core
-    ^  ^________________________
-    |             |             |
-venue-adapter    wire           |
-    ^  ^          ^             |
-    |  |__________|_____________|
-    |             |
-venue-binance   recorder (depends on venue-core, venue-adapter, wire)
-       (examples use recorder as dev-dependency)
+venue-adapter  ─►  venue-core
+wire           ─►  venue-core
+venue-binance  ─►  venue-adapter, venue-core    (dev-dep: recorder, for examples)
+recorder       ─►  venue-adapter, venue-core, wire
 ```
 
 `venue-adapter` deliberately does **not** depend on `wire`: adapters are
@@ -103,8 +98,8 @@ non-numeric book versions get their own payload variants (additive-safe).
 - `venue_ts` = the venue **transaction time** wherever the venue provides one
   (bookTicker `T`, trade `T`, depth `T`, forceOrder `o.T`, REST depth `T`).
   Note: `DataType::Trade` maps to `<symbol>@trade` (per-fill, carries the fill
-  type `X`) — live-verified 2026-06-10 that fapi `@aggTrade` no longer emits;
-  the aggTrade parser arm is kept as a fallback.
+  type `X`) — live verification on 2026-06-10 showed fapi `@aggTrade` no longer
+  emits; the aggTrade parser arm is kept as a fallback.
 - Exception: `markPriceUpdate` has no transaction time (its `T` is
   next-funding-time), so mark/index/funding-prediction events carry event time
   `E` in `venue_ts`.
