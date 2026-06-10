@@ -341,20 +341,20 @@ events + finality tags), not a mutable store.
 
 ## 4. New findings index
 
-| ID | Severity | Finding | Acts on |
-|---|---|---|---|
-| R1 | Critical (decide now) | Flat payload enum can't absorb multi-domain growth; namespace `Market/Reference/Chain/Account/Control` in the current re-cut, additive-only policy | improvement_plan step 3 |
-| R2 | Critical (decide now) | No raw-frame capture tier; every parser defect is permanent loss (the D1/D7/N1/A4 class); add a raw tee, default-on for bring-up venues | new, Phase 1 |
-| R3 | High | No chain provenance/finality/reorg vocabulary; `Decimal` can't hold u256 raw amounts | schema re-cut (reserve fields), Phase 5 |
-| R4 | High | No instrument lifecycle; ephemeral universes (prediction markets) unrepresentable; cross-venue *event* identity is research-layer, keep out of capture symbology | A3/A11 riders |
-| R5 | High | Strategy runtime must own clock/timers/state/I-O via `Ctx`; views (book, funding) framework-owned; parity by construction | Phase 4 design |
-| R6 | High | `Trade.id: u64` (plan step 3) breaks on Bybit/Polymarket/chains — make ids venue-raw strings before wire v1 freezes | improvement_plan step 3 |
-| R7 | Medium | Execution mechanics: gateways co-located with keys, sync RiskGate + out-of-process kill switch, position reconciliation, private WAL | Phase 6 |
-| R8 | Medium | Backtest economics layer: funding-accrual sim, fee model from SCD, conservative fill model as documented assumption | Phase 4 |
-| R9 | Medium | Per-event `SourceId` (which conn/poller/watcher) — gap forensics, WS-vs-REST dedup, multi-source venues | schema re-cut |
-| R10 | Medium | Data catalog/manifest with QA status; replay and research query it instead of globbing | Phase 3 |
-| R11 | Medium | Formalize venue process = N `IngestSource`s sharing one sink/WAL (generalizes A8; dissolves "venue=WsPool") | Phase 1–2 |
-| R12 | Low | Workspace hygiene: consolidate deps in `[workspace.dependencies]`, trim `tokio full`/`prettyprint`, add CI + lints in one pass | with config work |
+| ID | Severity | Finding | Acts on | Status 2026-06-10 |
+|---|---|---|---|---|
+| R1 | Critical (decide now) | Flat payload enum can't absorb multi-domain growth; namespace `Market/Reference/Chain/Account/Control` in the current re-cut, additive-only policy | improvement_plan step 3 | **Done** — namespaced in wire v1 |
+| R2 | Critical (decide now) | No raw-frame capture tier; every parser defect is permanent loss (the D1/D7/N1/A4 class); add a raw tee, default-on for bring-up venues | new, Phase 1 | **Done** — `RawWalWriter` → `data/raw/`, default-on in smoke |
+| R3 | High | No chain provenance/finality/reorg vocabulary; `Decimal` can't hold u256 raw amounts | schema re-cut (reserve fields), Phase 5 | **Reserved** — `Provenance`/`Finality`/`Reorg` in wire v1; u256 story = Phase 5 |
+| R4 | High | No instrument lifecycle; ephemeral universes (prediction markets) unrepresentable; cross-venue *event* identity is research-layer, keep out of capture symbology | A3/A11 riders | **Types frozen** — `LifecycleState`, `ReferencePayload`; producers = Phase 2 universe manager |
+| R5 | High | Strategy runtime must own clock/timers/state/I-O via `Ctx`; views (book, funding) framework-owned; parity by construction | Phase 4 design | Open (Phase 4) |
+| R6 | High | `Trade.id: u64` (plan step 3) breaks on Bybit/Polymarket/chains — make ids venue-raw strings before wire v1 freezes | improvement_plan step 3 | **Done** — `Trade.id: Arc<str>`; book-sequence ids stay u64 (documented deviation from decision 8: splice arithmetic) |
+| R7 | Medium | Execution mechanics: gateways co-located with keys, sync RiskGate + out-of-process kill switch, position reconciliation, private WAL | Phase 6 | Open (Phase 6) |
+| R8 | Medium | Backtest economics layer: funding-accrual sim, fee model from SCD, conservative fill model as documented assumption | Phase 4 | Open (Phase 4) |
+| R9 | Medium | Per-event `SourceId` (which conn/poller/watcher) — gap forensics, WS-vs-REST dedup, multi-source venues | schema re-cut | **Done** — envelope field + registry convention (0=REST, 1+=WS) |
+| R10 | Medium | Data catalog/manifest with QA status; replay and research query it instead of globbing | Phase 3 | Open (Phase 3) |
+| R11 | Medium | Formalize venue process = N `IngestSource`s sharing one sink/WAL (generalizes A8; dissolves "venue=WsPool") | Phase 1–2 | Partially emergent (snapshot fetcher + WS pool share one sink); trait formalization = Phase 1–2 |
+| R12 | Low | Workspace hygiene: consolidate deps in `[workspace.dependencies]`, trim `tokio full`/`prettyprint`, add CI + lints in one pass | with config work | **Done** — workspace deps, tokio trim, CI, `unsafe_code = forbid` |
 
 ---
 
@@ -567,6 +567,16 @@ designed, plus, in the same wire-v1 freeze: domain namespacing (R1), funding
 audit's P1–P5 amendments (BadVersion policy, parser fixtures, exchangeInfo dump).
 *Exit: wire v1 frozen containing every retroactively-unfixable field; pu-chain
 acceptance passes on a live capture.*
+
+> **✅ Exit criterion met 2026-06-10.** Wire v1 frozen (golden-bytes +
+> encoding-probe tests pin the layout). Live acceptance
+> (`recorder/examples/verify_depth.rs` on a 151k-event capture): 0 chain
+> breaks, both REST snapshots spliceable (`U <= lastUpdateId <= u`), 0 corrupt
+> frames, control timeline (SubAck/ConnUp/ConnDown) recorded; raw tee CRC-valid
+> end-to-end; WAL-fatality drill exits 1. Field discovery during acceptance:
+> fapi `@aggTrade` no longer emits — `DataType::Trade` maps to `@trade`
+> (per-fill, `X` fill type captured as `Trade.kind`); the raw tee caught this
+> exactly as R2 intended.
 
 **Phase 1 — unattended capture.** Config + `venue-process` (plan step 11), edge-WAL
 placement (A2), raw tee (R2), rotation + hourly conversion automation (P6),

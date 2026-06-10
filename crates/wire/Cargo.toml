@@ -3,11 +3,15 @@
   version = "0.1.0"
   edition = "2021"
 
+  [lints]
+  workspace = true
+
   [dependencies]
   venue-core = { path = "../venue-core" }
-  rmp-serde = "1"
-  serde = { version = "1", features = ["derive"] }
+  rmp-serde = { workspace = true }
+  serde = { workspace = true }
+  crc32fast = { workspace = true }
 
   [dev-dependencies]
-  rust_decimal = "1"
-  rust_decimal_macros = "1"
+  rust_decimal = { workspace = true }
+  rust_decimal_macros = { workspace = true }

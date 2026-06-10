@@ -2,8 +2,15 @@ use recorder::parquet_converter::convert_wal;
 use std::path::Path;
 
 fn main() {
-    let wal_path = Path::new("data/wal/binance/2026-06-05.wal");
-    let output_dir = Path::new("data/parquet/binance/2026-06-05");
+    tracing_subscriber::fmt().init();
+
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() != 3 {
+        eprintln!("usage: convert_wal <wal-file> <output-dir>");
+        std::process::exit(2);
+    }
+    let wal_path = Path::new(&args[1]);
+    let output_dir = Path::new(&args[2]);
 
     match convert_wal(wal_path, output_dir) {
         Ok(()) => {

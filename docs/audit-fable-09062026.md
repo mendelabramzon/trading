@@ -16,6 +16,25 @@ the plan itself. Finding namespaces: `DOC*` = documentation, `N*` = new code
 findings, `P*` = plan critique — chosen not to collide with the assessment's D/Bug
 numbering.*
 
+## STATUS — 2026-06-10 dispositions (post Phase-0 implementation)
+
+- **Done**: P1 (BadVersion abort fence + >1% corrupt-bytes conversion gate),
+  P2/N3 (null+warn, nullable columns), P3 (zstd + `Timestamp(ns, UTC)`),
+  P4/N4 (parser fixture suite in `venue-binance`), N1/P5a (raw exchangeInfo
+  dump via `fetch_instruments_raw` — smoke writes `data/meta/`; venue-process
+  owns it in Phase 1), N2 (WAL I/O error → process exit), N6 (channel 100K ≈ 2 s),
+  N9 (derives), N12 (error frames surfaced by the reply watcher; pong failure →
+  reconnect; tokio features trimmed; workspace deps consolidated; read_wal /
+  convert_wal take path arguments), DOC1–DOC6 (README/architecture.md rewritten
+  2026-06-10).
+- **Decided, documented**: N11 — `FundingRateRealized` stays in the schema with
+  no live producer; the Phase-2 REST backfill (`/fapi/v1/fundingRate`) is its
+  producer. N5 — replay ordering axis contract recorded in `architecture.md` §6.
+- **Still open → Phase 1**: P5b/N8 (startup retry policy), P5c (config-driven
+  fatality policy), P5d (heartbeat), P6 (conversion automation), N7 (long-horizon
+  depth soak — first live pu-chain acceptance passed 2026-06-10), N10 (alloc
+  hygiene — deliberately deferred, profile first).
+
 ---
 
 ## 1. Verification of prior claims

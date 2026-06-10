@@ -157,10 +157,9 @@ will want a synchronous `try_send()` path.
 **`InstrumentId` and `VenueId` as `String`.** RESOLVED. Both now use `Arc<str>`,
 eliminating per-event heap allocation. Clone cost is an atomic increment.
 
-**Wire format mismatch.** PARTIALLY RESOLVED. The code has always used
-MessagePack via `rmp-serde`. The `architecture.md` file still mentions "bincode"
-in the Planned table for the `wire` crate — this will be corrected in the
-architecture doc update.
+**Wire format mismatch.** RESOLVED. The code has always used MessagePack via
+`rmp-serde`; `architecture.md` was rewritten 2026-06-10 and documents the framed
+format (`[magic][version][len][crc32][payload]`).
 
 **No configuration system.** Still valid, unchanged. Venues, instruments, data
 paths, log levels — all hardcoded in example code. A TOML config file parsed
@@ -231,8 +230,11 @@ Two rounds of hardening fixes closed the critical reliability gaps identified in
 the initial assessment. The WAL now fsyncs periodically, send failures are
 logged, the Parquet converter streams instead of loading full files into memory,
 all 8 event types are persisted, events carry monotonic sequence numbers, and
-the smoke example shuts down cleanly. The recorder can be trusted for unattended
-24/7 data collection.
+the smoke example shuts down cleanly. *(2026-06-09 correction: the subsequent
+assessment found the captured data itself unreconstructable — D1–D7 — so
+"trusted for unattended 24/7 collection" was premature. That bar was reached
+with the 2026-06-10 Phase-0 re-cut; fully unattended operation still awaits the
+Phase-1 venue-process/supervision work.)*
 
 The next milestone is infrastructure: configuration (TOML), CI pipeline, and WAL
 rotation. After that, the transport layer (UDS) and event bus make the

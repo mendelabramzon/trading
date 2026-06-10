@@ -3,193 +3,132 @@
 Event-driven market data infrastructure for collecting, recording, and replaying
 data from multiple venues. Built for strategy development and live trading.
 
+**Status (2026-06-10):** single-venue capture is real and hardened — Binance
+USD-M futures → framed WAL (+ raw-frame tee) → zstd Parquet, with the wire-v1
+schema frozen (see `docs/report-fable-10062026.md` Phase 0). The event bus,
+replay, and strategy layers are designed but **not built yet**; diagrams below
+mark them *(planned)*.
+
 ## Architecture
 
-### System Overview
-
-Every component communicates through a single abstraction — `EventSink`. Venue
-adapters, the event bus, recorder, replay engine, and trading strategies all
-produce or consume the same `Event` type. Swapping transport, adding venues, or
-plugging in a new strategy requires no changes to existing components.
+**Durability lives at the edge**: each venue process writes its own WAL
+in-process before anything else sees an event. The future bus serves live
+consumers only and is allowed to be lossy (it injects `Gap` control events) —
+it is never in the durability path.
 
 ```mermaid
 graph LR
-    subgraph Venues ["Venue Processes"]
+    subgraph Venue ["Venue Process (built: Binance)"]
         direction TB
-        B[Binance<br/><i>WsPool · N conns</i>]
-        BY[Bybit<br/><i>WsPool · N conns</i>]
-        OKX[OKX<br/><i>WsPool · N conns</i>]
+        WS[WsPool<br/><i>acks · stale watchdog · reconnect</i>]
+        REST[REST<br/><i>depth snapshots · fundingInfo</i>]
+        WAL[("data/wal/*.wal<br/>data/raw/*.rawwal")]
+        WS --> WAL
+        REST --> WAL
     end
 
-    subgraph Bus ["Event Bus"]
-        direction TB
-        R{{"Topic Router<br/><i>venue · instrument · data_type</i>"}}
+    subgraph Bus ["Event Bus (planned)"]
+        R{{"Topic Router<br/><i>lossy · gap-counted</i>"}}
     end
 
-    subgraph Consumers ["Consumer Processes"]
-        direction TB
-        REC[Recorder<br/><i>WAL → Parquet</i>]
-        S1[Strategy A]
-        S2[Strategy B]
+    subgraph Consumers ["Live Consumers (planned)"]
+        S1[Strategies]
         MON[Monitor / Metrics]
     end
 
-    B -- "EventSink" --> R
-    BY -- "EventSink" --> R
-    OKX -- "EventSink" --> R
+    WS -.-> R
+    R -.-> S1
+    R -.-> MON
 
-    R -- "filtered" --> REC
-    R -- "filtered" --> S1
-    R -- "filtered" --> S2
-    R -- "filtered" --> MON
+    WAL --> PC["Parquet Converter<br/><i>manual today; hourly in Phase 1</i>"]
+    PC --> PQ[("data/parquet/<br/>zstd, per type")]
 
-    style Venues fill:#1a1a2e,stroke:#16213e,color:#e0e0e0
-    style Bus fill:#0f3460,stroke:#16213e,color:#e0e0e0
-    style Consumers fill:#1a1a2e,stroke:#16213e,color:#e0e0e0
+    style Venue fill:#1a1a2e,stroke:#16213e,color:#e0e0e0
+    style Bus fill:#0f3460,stroke:#16213e,color:#e0e0e0,stroke-dasharray: 5 5
+    style Consumers fill:#1a1a2e,stroke:#16213e,color:#e0e0e0,stroke-dasharray: 5 5
 ```
 
-### Event Flow
+### Event envelope (wire v1, frozen)
 
-A single event traced from exchange WebSocket to strategy and storage:
+All components produce or consume one `Event` type:
 
-```mermaid
-sequenceDiagram
-    participant WS as Exchange WS
-    participant VA as Venue Adapter
-    participant BUS as Event Bus
-    participant STR as Strategy
-    participant REC as Recorder
-
-    WS->>VA: JSON frame
-    activate VA
-    Note over VA: Deserialize<br/>Stamp local_ts<br/>Construct Event
-    VA->>BUS: sink.send(Event)
-    deactivate VA
-    activate BUS
-    Note over BUS: Topic filter:<br/>venue / instrument / type
-    par fan-out
-        BUS->>STR: Event
-        BUS->>REC: Event
-    end
-    deactivate BUS
-    activate STR
-    Note over STR: on_event(&Event)<br/>signal generation
-    deactivate STR
-    activate REC
-    Note over REC: WAL append<br/>(hot path)
-    REC-->>REC: background: WAL → Parquet
-    deactivate REC
+```rust
+Event {
+    venue, instrument,
+    venue_ts,      // venue transaction time
+    local_ts,      // capture-host time (mandatory; replay merge clock)
+    source,        // which connection/poller produced it
+    provenance,    // reserved for on-chain sources
+    payload,       // Market | Reference | Chain | Account | Control
+}
 ```
 
-### Live vs Replay: Same Interface
+Market data covers books (ticker / snapshots / diffs with venue update-id
+chains), trades (string ids), mark/index, funding (with interval + clamps),
+open interest, and liquidations. Control events (`ConnUp/Down`, `SubAck`,
+`Gap`, …) are recorded in the WAL like market data, so replay sees the same
+discontinuities live consumers saw. The wire format is versioned, CRC-framed,
+and self-healing on read; field order is frozen per version
+(`docs/architecture.md` §3).
 
-Strategies implement a single event handler. The framework decides whether events
-come from live venues or from recorded Parquet files. The strategy cannot tell
-the difference.
+### Live vs Replay: same interface *(replay planned — Phase 4)*
 
-```mermaid
-graph TB
-    subgraph Live
-        V[Venue Adapter] -- "EventSink" --> BUS1[Event Bus]
-    end
+Strategies implement a single event handler; the framework decides whether
+events come from live venues or recorded files. Replay sorts (files are
+arrival-ordered) and replays control events, so backtests cannot see a fantasy
+continuity that live never had.
 
-    subgraph Replay
-        PQ[(Parquet Files)] --> RP[Replay Engine]
-    end
-
-    BUS1 -- "Event" --> EH
-    RP -- "Event" --> EH
-
-    EH["Strategy<br/><i>fn on_event(&Event)</i>"]
-
-    style Live fill:#1a1a2e,stroke:#16213e,color:#e0e0e0
-    style Replay fill:#1a1a2e,stroke:#16213e,color:#e0e0e0
-    style EH fill:#533483,stroke:#16213e,color:#e0e0e0
-```
-
-### Recording Pipeline
+### Recording pipeline (built)
 
 ```mermaid
 graph LR
-    E[Events] --> WAL["WAL Writer<br/><i>append-only binary<br/>dedicated OS thread</i>"]
-    WAL --> F[("data/wal/<br/>binance/2026-06-04.wal")]
-    F --> PC["Parquet Converter<br/><i>background task</i>"]
-    PC --> PQ[("data/parquet/<br/>binance/2026-06-04/<br/>book_ticker.parquet<br/>trades.parquet<br/>...")]
+    E[Events] --> W["WalSink<br/><i>lossless, dedicated thread,<br/>1s fsync, midnight rotation</i>"]
+    RT[Raw WS frames] --> RW["RawWalSink<br/><i>best-effort tee (R2)</i>"]
+    W --> F[("data/wal/binance/<date>.wal")]
+    RW --> F2[("data/raw/binance/<date>.rawwal")]
+    F --> PC["convert_wal<br/><i>manual; automation = Phase 1</i>"]
+    PC --> PQ[("data/parquet/binance/<date>/<br/>book_ticker · book_update · trades<br/>funding_rate · liquidation · control · …")]
 
-    style WAL fill:#0f3460,stroke:#16213e,color:#e0e0e0
+    style W fill:#0f3460,stroke:#16213e,color:#e0e0e0
+    style RW fill:#0f3460,stroke:#16213e,color:#e0e0e0
     style PC fill:#0f3460,stroke:#16213e,color:#e0e0e0
 ```
 
-### WebSocket Connection Sharding
+A WAL I/O error exits the process (a capture process that cannot persist must
+die visibly, not look healthy while recording nothing). The raw tee makes
+parser defects survivable: re-run normalization instead of losing the day.
 
-Each venue adapter automatically shards subscriptions across multiple WebSocket
-connections when the stream count exceeds the exchange's per-connection limit.
+### WebSocket connection sharding (built)
 
-```mermaid
-graph LR
-    SUB["subscribe(300 instruments × 3 types)<br/><i>= 900 streams</i>"]
-
-    SUB --> POOL[WsPool]
-
-    POOL --> C1["WS Conn 1<br/><i>200 streams</i>"]
-    POOL --> C2["WS Conn 2<br/><i>200 streams</i>"]
-    POOL --> C3["WS Conn 3<br/><i>200 streams</i>"]
-    POOL --> C4["WS Conn 4<br/><i>200 streams</i>"]
-    POOL --> C5["WS Conn 5<br/><i>100 streams</i>"]
-
-    C1 --> SINK["EventSink<br/><i>shared, cloned</i>"]
-    C2 --> SINK
-    C3 --> SINK
-    C4 --> SINK
-    C5 --> SINK
-
-    style POOL fill:#533483,stroke:#16213e,color:#e0e0e0
-    style SINK fill:#0f3460,stroke:#16213e,color:#e0e0e0
-```
-
-### Plugging In a Strategy
-
-A strategy is any consumer that receives events from the bus. Subscribe with a
-topic filter to receive only the data you need.
-
-```mermaid
-graph LR
-    BUS[Event Bus]
-
-    BUS -->|"all events"| REC[Recorder]
-    BUS -->|"btcusdt + ethusdt<br/>BookTicker only"| MM["Market Making<br/>Strategy"]
-    BUS -->|"all perps<br/>FundingRate only"| ARB["Funding Arb<br/>Strategy"]
-    BUS -->|"btcusdt<br/>all data types"| MOM["Momentum<br/>Strategy"]
-
-    style BUS fill:#0f3460,stroke:#16213e,color:#e0e0e0
-    style MM fill:#533483,stroke:#16213e,color:#e0e0e0
-    style ARB fill:#533483,stroke:#16213e,color:#e0e0e0
-    style MOM fill:#533483,stroke:#16213e,color:#e0e0e0
-```
+`WsPool` shards subscriptions at 200 streams/connection, watches SUBSCRIBE
+acks, reconnects with jittered backoff (immediately after stable sessions),
+re-snapshots depth on every reconnect, and emits `ConnUp/ConnDown` control
+events through the same sink.
 
 ## Crate Map
 
 | Crate | Status | Purpose |
 |-------|--------|---------|
-| `venue-core` | built | Domain types: `Event`, `Payload`, `Level`, `Trade`, `InstrumentId`, `VenueId`, `Nanos` |
-| `venue-adapter` | built | Traits: `VenueAdapter<S: EventSink>`, `EventSink`, `Subscription`, `DataType` |
-| `venue-binance` | built | Binance Futures adapter with WsPool sharding |
-| `wire` | built | Binary event serialization for IPC |
-| `transport` | planned | `EventSink` impls: `UdsSink` (Phase 1), `ShmSink` (Phase 2) |
-| `event-bus` | planned | Central pub/sub event router with topic filtering |
-| `recorder` | built | WAL hot capture + Parquet conversion |
-| `replay` | planned | Parquet reader, emits events through `EventSink` |
+| `venue-core` | built | Envelope v2, domain payloads, symbology types (`Asset`, `InstrumentClass`, `CanonicalInstrumentId`), `SourceId`, `Provenance`, `RawFrame` |
+| `venue-adapter` | built | Traits (RPITIT): `EventSink` (+`send_batch`), `RawFrameSink`, `VenueAdapter<S>`, `Subscription{scope,data}` |
+| `venue-binance` | built | Binance USD-M adapter: WsPool, REST snapshot fetcher, fundingInfo, exchangeInfo dump, fixture tests |
+| `wire` | built | Framed MessagePack (`magic/version/len/crc32`), self-healing `FrameReader`, golden-bytes layout pin |
+| `recorder` | built | `WalWriter`/`WalSink`, `RawWalWriter`, zstd Parquet converter, acceptance checker (`verify_depth`) |
+| `config` + `venue-process` | planned (Phase 1) | TOML config + unattended supervised entrypoint |
+| `backfill` / `symbology` | planned (Phase 2) | REST history + reconciliation; canonical instrument registry |
+| `bus` / `replay` / `strategy` / `execution` | planned (Phases 3–6) | See `docs/report-fable-10062026.md` §7 roadmap |
 
-## IPC Transport Phases
+## Quick start
 
-| Phase | Transport | Latency | Change required |
-|-------|-----------|---------|-----------------|
-| 1 | Unix Domain Sockets | ~20-55 us end-to-end | — |
-| 2 | Shared Memory Ring Buffers | < 10 us end-to-end | swap `EventSink` impl at startup |
-
-No venue, strategy, or consumer code changes between phases. Only the concrete
-type passed to `BinanceAdapter::new(sink)` differs.
+```bash
+cargo run -p venue-binance --example smoke            # live capture → data/wal + data/raw
+cargo run -p recorder --example read_wal data/wal/binance/<date>.wal
+cargo run -p recorder --example verify_depth data/wal/binance/<date>.wal   # pu-chain/splice gate
+cargo run -p recorder --example convert_wal data/wal/binance/<date>.wal data/parquet/binance/<date>
+```
 
 ## See Also
 
-- [docs/architecture.md](docs/architecture.md) — full technical architecture with code examples, wire formats, and latency budgets
+- [docs/architecture.md](docs/architecture.md) — contracts: schema freeze rules, timestamp semantics, reader recovery, converter schemas
+- [docs/report-fable-10062026.md](docs/report-fable-10062026.md) — target architecture and phased roadmap (R1–R12)
+- [docs/improvement_plan.md](docs/improvement_plan.md) — the implemented Phase-0 remediation, with as-built amendments

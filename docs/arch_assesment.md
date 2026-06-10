@@ -15,8 +15,32 @@ Parquet files stay arrival-ordered and replay does the k-way merge + in-file sor
 letting the converter stream in 500K-row batches; (Bug 1) the recorder emits a REST
 `/fapi/v1/depth` snapshot only, leaving book reconstruction to replay; (async_trait)
 migrate `EventSink`/`VenueAdapter` to native RPITIT now; (WAL) the new framed format
-supersedes the existing ~4.3 MB of recordings, which are unreconstructable anyway.
-Nothing below is implemented yet — the items remain open.*
+supersedes the existing ~4.3 MB of recordings, which are unreconstructable anyway.*
+
+## RESOLVED — 2026-06-10
+
+**Every finding below (D1–D7, Bugs 1–4, and the code-quality items) was fixed by
+the Phase-0 wire-v1 re-cut.** One-line dispositions; details in
+[`improvement_plan.md`](improvement_plan.md) STATUS and `architecture.md`:
+
+| Finding | Resolution |
+|---|---|
+| D1 (U/u/pu dropped) | `BookUpdate` carries `first/final/prev_final_update_id`; pu-chain live-verified |
+| D2 (useless `sequence`) | `sequence` deleted; venue ids + per-event `SourceId` do its job |
+| D3 (unsorted Parquet) | Contract documented: files arrival-ordered, replay sorts, tie-break `(venue_ts, local_ts, position)` |
+| D4 (level_idx on diffs) | Schemas forked: snapshots keep `level_idx`+`last_update_id`; updates drop it, carry id columns |
+| D5 (silent 0.0) | `dec_opt`: null + warn; all price columns nullable |
+| D6 (no framing) | `[magic][version][len][crc32]` + self-healing `FrameReader`; BadVersion aborts (P1) |
+| D7 (mixed venue_ts) | venue_ts = transaction time uniformly; markPrice `E` exception documented; depth `E` kept as `event_time` |
+| Bug 1 (no snapshots) | REST fetcher: first-depthUpdate trigger per session + reconnect + 30-min sweep, paced |
+| Bug 2 (full-day buffering) | 500K-row streaming batches, multiple row groups |
+| Bug 3 (3 sequential sends) | `send_batch` on `EventSink`; markPrice arm emits one batch |
+| Bug 4 (kind lossy) | `InstrumentClass::{Spot, Perp, Future{expiry}, PredictionOutcome, Pool}` replaces `InstrumentKind`; *_QUARTER → `Future` |
+
+The LOC/test counts and dependency tables below describe the 2026-06-08
+codebase and are kept as the historical record (now: 38 tests, clippy clean,
+CI in `.github/workflows/ci.yml`; +`crc32fast`, +`rand`, +`serde_bytes`,
+−`async-trait`).
 
 *Reviewed 2026-06-09 (post-planning review pass, verified against source +
 `rmp-serde` 1.3.1 internals + an encoding probe): D6's failure mode refined (field

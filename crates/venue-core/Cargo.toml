@@ -3,6 +3,10 @@
   version = "0.1.0"
   edition = "2021"
 
+  [lints]
+  workspace = true
+
   [dependencies]
-  serde = { version = "1", features = ["derive", "rc"] }
-  rust_decimal = { version = "1", features = ["serde-with-str"] }
+  serde = { workspace = true }
+  serde_bytes = { workspace = true }
+  rust_decimal = { workspace = true }

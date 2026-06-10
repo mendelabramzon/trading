@@ -1,6 +1,7 @@
-use async_trait::async_trait;
-use venue_core::{Event, Instrument, InstrumentId, VenueId};
+use std::future::Future;
+use venue_core::{Event, Instrument, InstrumentClass, InstrumentId, RawFrame, VenueId};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DataType {
     BookTicker,
     BookDepth,
@@ -8,11 +9,26 @@ pub enum DataType {
     FundingRate,
     MarkPrice,
     IndexPrice,
+    Liquidation,
+    /// REST-only on most CEXes; captured by pollers, not streams.
+    OpenInterest,
 }
 
+/// What a subscription covers (A6). Venue-wide streams (`All`) are one stream
+/// instead of hundreds and immune to listing lag; adapters map them to the
+/// venue's native form where one exists.
+#[derive(Debug, Clone)]
+pub enum Scope {
+    Instruments(Vec<InstrumentId>),
+    /// Every instrument of a class; expanded by the Phase-2 universe manager.
+    Class(InstrumentClass),
+    All,
+}
+
+#[derive(Debug, Clone)]
 pub struct Subscription {
-    pub instrument: InstrumentId,
-    pub data_type: Vec<DataType>,
+    pub scope: Scope,
+    pub data: Vec<DataType>,
 }
 
 #[derive(Debug)]
@@ -38,9 +54,27 @@ impl std::fmt::Display for VenueError {
 
 impl std::error::Error for VenueError {}
 
-#[async_trait]
+/// The universal boundary between event producers and consumers.
+///
+/// Not dyn-compatible (RPITIT); the future event bus will need an erasing
+/// wrapper if dynamic dispatch ever becomes necessary.
 pub trait EventSink: Send + Sync + Clone + 'static {
-    async fn send(&self, event: Event) -> Result<(), EventSinkError>;
+    fn send(&self, event: Event) -> impl Future<Output = Result<(), EventSinkError>> + Send;
+
+    /// Send several events produced by one venue message without interleaving
+    /// other awaits between them. The default loops `send`; sinks with a
+    /// cheaper bulk path (e.g. a WAL sink) should override.
+    fn send_batch(
+        &self,
+        events: Vec<Event>,
+    ) -> impl Future<Output = Result<(), EventSinkError>> + Send {
+        async move {
+            for event in events {
+                self.send(event).await?;
+            }
+            Ok(())
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -60,22 +94,38 @@ impl std::fmt::Display for EventSinkError {
 
 impl std::error::Error for EventSinkError {}
 
-#[async_trait]
 impl EventSink for tokio::sync::mpsc::Sender<Event> {
     async fn send(&self, event: Event) -> Result<(), EventSinkError> {
+        // Resolves to the inherent `Sender::send`, not this trait method.
         self.send(event).await.map_err(|_| EventSinkError::Closed)
     }
 }
 
-#[async_trait]
+/// Receives raw venue frames before parsing (the R2 raw-capture tee).
+///
+/// Synchronous by design: implementations hand the frame to a channel and
+/// return; the tee must never add an await point to the hot read loop.
+pub trait RawFrameSink: Send + Sync + Clone + 'static {
+    fn send_raw(&self, frame: RawFrame);
+}
+
+/// No-op tee for venues running without raw capture.
+impl RawFrameSink for () {
+    fn send_raw(&self, _frame: RawFrame) {}
+}
+
 pub trait VenueAdapter<S: EventSink>: Send + Sync {
     fn venue_id(&self) -> &VenueId;
 
-    async fn fetch_instruments(&self) -> Result<Vec<Instrument>, VenueError>;
+    fn fetch_instruments(&self)
+        -> impl Future<Output = Result<Vec<Instrument>, VenueError>> + Send;
 
-    async fn connect(&mut self) -> Result<(), VenueError>;
+    fn connect(&mut self) -> impl Future<Output = Result<(), VenueError>> + Send;
 
-    async fn subscribe(&mut self, subscriptions: Vec<Subscription>) -> Result<(), VenueError>;
+    fn subscribe(
+        &mut self,
+        subscriptions: Vec<Subscription>,
+    ) -> impl Future<Output = Result<(), VenueError>> + Send;
 
-    async fn disconnect(&mut self) -> Result<(), VenueError>;
+    fn disconnect(&mut self) -> impl Future<Output = Result<(), VenueError>> + Send;
 }

@@ -3,7 +3,9 @@
   version = "0.1.0"
   edition = "2021"
 
+  [lints]
+  workspace = true
+
   [dependencies]
   venue-core = { path = "../venue-core" }
-  async-trait = "0.1"
-  tokio = { version = "1", features = ["sync"] }
+  tokio = { workspace = true, features = ["sync"] }

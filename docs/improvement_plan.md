@@ -2,11 +2,48 @@
 
 *Companion to [`arch_assesment.md`](arch_assesment.md). Authored 2026-06-09 as the
 implementation plan for the entire **What's Wrong** section (Data Integrity D1–D6,
-Bugs 1–4, Code Quality, Architectural Debt) plus **Phase 0**. Status: designed, not
-yet implemented — the assessment items remain open.*
+Bugs 1–4, Code Quality, Architectural Debt) plus **Phase 0**.*
 
 *Reviewed 2026-06-09 against source — substantive changes are listed under
 [Review deltas](#review-deltas-2026-06-09); steps 3, 6, and 9 changed materially.*
+
+## STATUS — implemented 2026-06-10 (steps 1–10 + report riders)
+
+**Steps 1–10 are implemented, tested and live-verified** as the Phase-0
+wire-v1 freeze of [`report-fable-10062026.md`](report-fable-10062026.md) §7,
+with these amendments shipped in the same re-cut:
+
+- **R1**: `Payload` is domain-namespaced (`Market/Reference/Chain/Account/Control`)
+  instead of the flat enum; `Payload::Error` deleted as planned.
+- **Step 3 amendment (R6)**: `Trade.id` is `Arc<str>` (venue-raw string), not the
+  planned `u64` — Bybit hex ids / Polymarket / chain hashes don't fit u64. Book
+  sequence ids (`update_id`, `U/u/pu`) stay `u64` (splice arithmetic is
+  load-bearing; deviation from report decision 8, documented in
+  `architecture.md` §3).
+- **Envelope v2 (D2 resolution + R9/R3)**: `sequence` dropped entirely;
+  `local_ts` mandatory; `source: SourceId` added; `provenance: Option<Provenance>`
+  reserved for chains.
+- **A4/A6/A7/R4 riders**: funding `interval`+clamps (filled from
+  `/fapi/v1/fundingInfo`, 8h default), `OpenInterest`/`Liquidation` payloads
+  (liquidations wired live via `forceOrder`; OI awaits the Phase-2 poller),
+  `ControlPayload` (ConnUp/Down + SubAck wired; Gap/Snapshot brackets/Reorg
+  schema-only), `ReferencePayload` lifecycle events (producers: Phase 2),
+  symbology core types (A3) including the extended `Instrument`.
+- **P1**: `BadVersion` aborts the reader, never resyncs; conversion fails files
+  with >1% corrupt bytes. **P2/N3**: timestamps/decimals null+warn, never 0.
+  **P3**: zstd + `Timestamp(ns, UTC)` columns. **P4**: parser fixture tests.
+- **R2** (report): raw-frame tee — `RawWalWriter` → `data/raw/<venue>/<date>.rawwal`,
+  default-on in the smoke capture. **R12**: workspace deps consolidated, CI added.
+- **Step 9 as built**: snapshot fetcher task triggered by first depthUpdate per
+  symbol per connection session (re-snapshot on reconnect emergent) + 30-min
+  periodic sweep; paced ≥0.5 s; one retry.
+- **Step 11 split**: the documentation half is done; the `config` crate and
+  `venue-process` binary move to Phase 1 (with P5d heartbeat, P6 conversion
+  automation, N8 startup retry).
+
+Acceptance: pu-chain + snapshot-splice check passes on a live capture
+(`recorder/examples/verify_depth.rs`); see `report-fable-10062026.md` §7 Phase 0
+exit criterion.
 
 ## Context
 

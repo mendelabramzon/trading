@@ -1,7 +1,28 @@
-[workspace]                                                                     
-  members = ["crates/venue-core", "crates/venue-adapter", "crates/venue-binance", "crates/wire", "crates/recorder"]                                                 
+[workspace]
+  members = ["crates/venue-core", "crates/venue-adapter", "crates/venue-binance", "crates/wire", "crates/recorder"]
   resolver = "2"
 
 [workspace.dependencies]
+  arrow = { version = "55", default-features = false }
+  chrono = "0.4"
+  crc32fast = "1"
+  futures-util = "0.3"
+  num-traits = "0.2"
+  parquet = { version = "55", features = ["arrow"] }
+  rand = "0.9"
+  reqwest = { version = "0.12", features = ["json"] }
+  rmp-serde = "1"
+  rust_decimal = { version = "1", features = ["serde-with-str"] }
+  rust_decimal_macros = "1"
+  serde = { version = "1", features = ["derive", "rc"] }
+  serde_bytes = "0.11"
+  serde_json = "1"
+  tempfile = "3"
+  tokio = "1"
+  tokio-tungstenite = { version = "0.26", features = ["native-tls"] }
+  tokio-util = "0.7"
   tracing = "0.1"
   tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[workspace.lints.rust]
+  unsafe_code = "forbid"
