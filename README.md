@@ -3,11 +3,13 @@
 Event-driven market data infrastructure for collecting, recording, and replaying
 data from multiple venues. Built for strategy development and live trading.
 
-**Status (2026-06-10):** single-venue capture is real and hardened — Binance
-USD-M futures → framed WAL (+ raw-frame tee) → zstd Parquet, with the wire-v1
-schema frozen (see `docs/report-fable-10062026.md` Phase 0). The event bus,
-replay, and strategy layers are designed but **not built yet**; diagrams below
-mark them *(planned)*.
+**Status (2026-06-11):** single-venue capture is real, hardened, and
+**unattended** (Phase 1 complete) — Binance USD-M futures → framed WAL
+(+ raw-frame tee) → zstd Parquet with a daily QA report, run from a TOML
+config under systemd with startup retry, heartbeat, and hourly conversion
+(see `docs/report-fable-10062026.md` §7). The event bus, replay, and strategy
+layers are designed but **not built yet**; diagrams below mark them
+*(planned)*.
 
 ## Architecture
 
@@ -40,8 +42,8 @@ graph LR
     R -.-> S1
     R -.-> MON
 
-    WAL --> PC["Parquet Converter<br/><i>manual today; hourly in Phase 1</i>"]
-    PC --> PQ[("data/parquet/<br/>zstd, per type")]
+    WAL --> PC["wal-sweep<br/><i>hourly timer · idempotent · daily QA</i>"]
+    PC --> PQ[("data/parquet/<br/>zstd, per type + qa_report.json")]
 
     style Venue fill:#1a1a2e,stroke:#16213e,color:#e0e0e0
     style Bus fill:#0f3460,stroke:#16213e,color:#e0e0e0,stroke-dasharray: 5 5
@@ -86,8 +88,8 @@ graph LR
     RT[Raw WS frames] --> RW["RawWalSink<br/><i>best-effort tee (R2)</i>"]
     W --> F[("data/wal/binance/<date>.wal")]
     RW --> F2[("data/raw/binance/<date>.rawwal")]
-    F --> PC["convert_wal<br/><i>manual; automation = Phase 1</i>"]
-    PC --> PQ[("data/parquet/binance/<date>/<br/>book_ticker · book_update · trades<br/>funding_rate · liquidation · control · …")]
+    F --> PC["wal-sweep<br/><i>hourly systemd timer; QA gate</i>"]
+    PC --> PQ[("data/parquet/binance/<date>/<br/>book_ticker · book_update · trades<br/>liquidation · control · qa_report.json · …")]
 
     style W fill:#0f3460,stroke:#16213e,color:#e0e0e0
     style RW fill:#0f3460,stroke:#16213e,color:#e0e0e0
@@ -113,19 +115,31 @@ events through the same sink.
 | `venue-adapter` | built | Traits (RPITIT): `EventSink` (+`send_batch`), `RawFrameSink`, `VenueAdapter<S>`, `Subscription{scope,data}` |
 | `venue-binance` | built | Binance USD-M adapter: WsPool, REST snapshot fetcher, fundingInfo, exchangeInfo dump, fixture tests |
 | `wire` | built | Framed MessagePack (`magic/version/len/crc32`), self-healing `FrameReader`, golden-bytes layout pin |
-| `recorder` | built | `WalWriter`/`WalSink`, `RawWalWriter`, zstd Parquet converter, acceptance checker (`verify_depth`) |
-| `config` + `venue-process` | planned (Phase 1) | TOML config + unattended supervised entrypoint |
-| `backfill` / `symbology` | planned (Phase 2) | REST history + reconciliation; canonical instrument registry |
+| `recorder` | built | `WalWriter`/`WalSink`, `RawWalWriter`, capture stats (heartbeat counters), zstd Parquet converter, QA module, `wal-sweep` bin, acceptance checker (`verify_depth`) |
+| `config` | built | Strict TOML capture config; rejects subscriptions the venue can't deliver |
+| `venue-process` | built | Unattended supervised capture entrypoint: startup retry, heartbeat, daily exchangeInfo dump, graceful shutdown |
+| `backfill` / `symbology` | planned (Phase 2) | REST history + reconciliation (incl. funding/mark via `premiumIndex` — the WS markPrice family is dead on fapi); canonical instrument registry |
 | `bus` / `replay` / `strategy` / `execution` | planned (Phases 3–6) | See `docs/report-fable-10062026.md` §7 roadmap |
 
 ## Quick start
 
 ```bash
-cargo run -p venue-binance --example smoke            # live capture → data/wal + data/raw
+# Capture (config-driven; ctrl+c / SIGTERM for graceful shutdown):
+cargo run -p venue-process -- configs/binance.toml
+
+# Convert closed days + daily QA report (idempotent; hourly via systemd in deploy):
+cargo run -p recorder --bin wal-sweep -- data/wal data/parquet
+
+# Inspect:
 cargo run -p recorder --example read_wal data/wal/binance/<date>.wal
-cargo run -p recorder --example verify_depth data/wal/binance/<date>.wal   # pu-chain/splice gate
-cargo run -p recorder --example convert_wal data/wal/binance/<date>.wal data/parquet/binance/<date>
+cargo run -p recorder --example verify_depth data/wal/binance/<date>.wal   # QA gate, on demand
+cat data/parquet/binance/<date>/qa_report.json
 ```
+
+Deployment (systemd units, chrony prerequisite, runbook): `deploy/README.md`.
+The `smoke` example remains as the bounded acceptance tool
+(`cargo run -p venue-binance --example smoke 100000 180`); `ws_probe` checks
+whether a fapi stream name actually emits (Binance ACKs dead stream names).
 
 ## See Also
 

@@ -21,13 +21,21 @@ const ACK_TIMEOUT: Duration = Duration::from_secs(10);
 /// waits out the backoff instead of retrying immediately.
 const STABLE_SESSION: Duration = Duration::from_secs(60);
 
-struct ExponentialBackoff {
+/// Shared retry policy (1 s doubling to 30 s, jittered). Used by every
+/// connection task here and re-exported for venue-process startup retry (N8).
+pub struct ExponentialBackoff {
     current: Duration,
     max: Duration,
 }
 
+impl Default for ExponentialBackoff {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ExponentialBackoff {
-    fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             current: Duration::from_secs(1),
             max: Duration::from_secs(30),
@@ -36,14 +44,14 @@ impl ExponentialBackoff {
 
     /// Doubling delay with up to +25% jitter so a venue-wide disconnect does
     /// not stampede every connection back at the same instant.
-    fn next_delay(&mut self) -> Duration {
+    pub fn next_delay(&mut self) -> Duration {
         let delay = self.current;
         self.current = (self.current * 2).min(self.max);
         let jitter_ms = rand::rng().random_range(0..=delay.as_millis() as u64 / 4);
         delay + Duration::from_millis(jitter_ms)
     }
 
-    fn reset(&mut self) {
+    pub fn reset(&mut self) {
         self.current = Duration::from_secs(1);
     }
 }

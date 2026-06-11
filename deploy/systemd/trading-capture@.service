@@ -1,0 +1,25 @@
+# Capture process for one venue: systemctl enable --now trading-capture@binance
+# Instance name (%i) selects /etc/trading/<venue>.toml.
+[Unit]
+Description=Trading market-data capture (%i)
+Wants=network-online.target
+After=network-online.target time-sync.target
+# Restart forever: the process rides out network outages itself (in-process
+# subscribe retry); restarts here cover crashes and WAL fatality exits (N2).
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=trading
+WorkingDirectory=/var/lib/trading
+ExecStart=/opt/trading/bin/venue-process /etc/trading/%i.toml
+Restart=always
+RestartSec=2
+# Exit 2 = invalid config/usage: restarting cannot help, stay down loudly.
+RestartPreventExitStatus=2
+# Heartbeat + capture logs go to journald (plain text; ansi off when no tty).
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

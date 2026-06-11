@@ -1,5 +1,13 @@
 [workspace]
-  members = ["crates/venue-core", "crates/venue-adapter", "crates/venue-binance", "crates/wire", "crates/recorder"]
+  members = [
+    "crates/venue-core",
+    "crates/venue-adapter",
+    "crates/venue-binance",
+    "crates/wire",
+    "crates/recorder",
+    "crates/config",
+    "crates/venue-process",
+  ]
   resolver = "2"
 
 [workspace.dependencies]
@@ -20,6 +28,7 @@
   tempfile = "3"
   tokio = "1"
   tokio-tungstenite = { version = "0.26", features = ["native-tls"] }
+  toml = "0.8"
   tokio-util = "0.7"
   tracing = "0.1"
   tracing-subscriber = { version = "0.3", features = ["env-filter"] }

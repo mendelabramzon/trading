@@ -1,0 +1,12 @@
+[Unit]
+Description=Hourly WAL sweep (conversion + QA)
+
+[Timer]
+OnCalendar=hourly
+# Run missed sweeps after downtime (the catch-up that makes conversion
+# zero-manual-steps across reboots).
+Persistent=true
+RandomizedDelaySec=120
+
+[Install]
+WantedBy=timers.target

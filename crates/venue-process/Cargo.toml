@@ -1,0 +1,18 @@
+  [package]
+  name = "venue-process"
+  version = "0.1.0"
+  edition = "2021"
+
+  [lints]
+  workspace = true
+
+  [dependencies]
+  config = { path = "../config" }
+  recorder = { path = "../recorder" }
+  venue-adapter = { path = "../venue-adapter" }
+  venue-binance = { path = "../venue-binance" }
+  venue-core = { path = "../venue-core" }
+  chrono = { workspace = true }
+  tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal", "time", "sync"] }
+  tracing = { workspace = true }
+  tracing-subscriber = { workspace = true }

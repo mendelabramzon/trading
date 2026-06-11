@@ -1,0 +1,13 @@
+  [package]
+  name = "config"
+  version = "0.1.0"
+  edition = "2021"
+
+  [lints]
+  workspace = true
+
+  [dependencies]
+  venue-adapter = { path = "../venue-adapter" }
+  venue-core = { path = "../venue-core" }
+  serde = { workspace = true }
+  toml = { workspace = true }

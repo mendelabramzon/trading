@@ -10,7 +10,9 @@
   venue-core = { path = "../venue-core" }
   venue-adapter = { path = "../venue-adapter" }
   wire = { path = "../wire" }
-  tokio = { workspace = true, features = ["rt"] }
+  # rt-multi-thread: WalSink::send_sync uses block_in_place (documented
+  # requirement; gated behind this feature).
+  tokio = { workspace = true, features = ["rt-multi-thread"] }
   chrono = { workspace = true }
   num-traits = { workspace = true }
   rust_decimal = { workspace = true }
@@ -19,10 +21,11 @@
   arrow = { workspace = true }
   parquet = { workspace = true }
   tracing = { workspace = true }
+  # wal-sweep bin only; the library does not init subscribers.
+  tracing-subscriber = { workspace = true }
 
   [dev-dependencies]
   tempfile = { workspace = true }
   rust_decimal = { workspace = true }
   rust_decimal_macros = { workspace = true }
   tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
-  tracing-subscriber = { workspace = true }

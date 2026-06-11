@@ -1,189 +1,102 @@
-//! Phase-0 acceptance checker (the pu-chain / splice gate).
+//! Acceptance checker (the pu-chain / splice gate), now a thin CLI over
+//! `recorder::qa` — the same code path the automated sweep runs daily.
 //!
-//! Reads a WAL and verifies, per instrument:
-//! 1. depth update chains: `pu == previous u` (breaks outside reconnects mean
-//!    lost data);
-//! 2. every REST snapshot is spliceable: some update covers `lastUpdateId`
-//!    (`U <= lastUpdateId <= u`).
+//! Verifies per instrument: depth chains (`pu == previous u`, breaks split
+//! into reconnect-explained vs unexplained), REST snapshot splices
+//! (`U <= lastUpdateId <= u`), trade-id regressions; prints the control
+//! timeline so findings can be matched to reconnects. Exits 1 on QA fail.
 //!
-//! Also prints the control-event timeline so chain breaks can be matched to
-//! reconnects.
+//! Usage: `verify_depth <path-to-wal-file>`
 
-use std::collections::HashMap;
-use std::fs::File;
-use std::io::BufReader;
-use venue_core::{ControlPayload, MarketPayload, Payload};
-
-#[derive(Default)]
-struct SymbolState {
-    updates: u64,
-    chain_breaks: Vec<String>,
-    last_final: Option<u64>,
-    snapshots: Vec<u64>,
-    spliced: HashMap<u64, bool>,
-    e_minus_t_ns: Vec<i64>,
-}
+use recorder::qa::{qa_wal, QaStatus};
+use std::path::Path;
 
 fn main() {
     let path = std::env::args()
         .nth(1)
         .expect("usage: verify_depth <path-to-wal-file>");
-    let mut reader = wire::FrameReader::new(BufReader::new(File::open(&path).expect("open WAL")));
+    let path = Path::new(&path);
 
-    let mut symbols: HashMap<String, SymbolState> = HashMap::new();
-    let mut by_kind: HashMap<&'static str, u64> = HashMap::new();
-    let mut controls: Vec<String> = Vec::new();
-    let mut total = 0u64;
+    // Venue/date here are report metadata only; derive what we can.
+    let date = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "unknown".into());
+    let venue = path
+        .parent()
+        .and_then(|p| p.file_name())
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "unknown".into());
 
-    loop {
-        let event = match reader.next_event() {
-            Ok(Some(e)) => e,
-            Ok(None) => break,
-            Err(e) => {
-                eprintln!("fatal decode error after {total} events: {e}");
-                break;
-            }
-        };
-        total += 1;
-        let instrument = event
-            .instrument
-            .as_ref()
-            .map(|i| i.value.to_string())
-            .unwrap_or_default();
+    let report = qa_wal(path, &venue, &date).expect("open WAL");
 
-        match &event.payload {
-            Payload::Market(MarketPayload::BookUpdate {
-                first_update_id,
-                final_update_id,
-                prev_final_update_id,
-                event_time,
-                ..
-            }) => {
-                *by_kind.entry("book_update").or_default() += 1;
-                let st = symbols.entry(instrument).or_default();
-                st.updates += 1;
-
-                if let (Some(pu), Some(prev_u)) = (prev_final_update_id, st.last_final) {
-                    if *pu != prev_u {
-                        st.chain_breaks.push(format!(
-                            "update #{}: pu={} but previous u={} (local_ts {})",
-                            st.updates, pu, prev_u, event.local_ts
-                        ));
-                    }
-                }
-                st.last_final = Some(*final_update_id);
-
-                if let Some(et) = event_time {
-                    if let Some(vt) = event.venue_ts {
-                        st.e_minus_t_ns.push(*et as i64 - vt as i64);
-                    }
-                }
-                for (snap_id, ok) in st.spliced.iter_mut() {
-                    if !*ok && *first_update_id <= *snap_id && *snap_id <= *final_update_id {
-                        *ok = true;
-                    }
-                }
-            }
-            Payload::Market(MarketPayload::BookSnapshot { last_update_id, .. }) => {
-                *by_kind.entry("book_snapshot").or_default() += 1;
-                let st = symbols.entry(instrument).or_default();
-                st.snapshots.push(*last_update_id);
-                st.spliced.insert(*last_update_id, false);
-            }
-            Payload::Market(m) => {
-                let kind = match m {
-                    MarketPayload::BookTicker { .. } => "book_ticker",
-                    MarketPayload::Trades { .. } => "trades",
-                    MarketPayload::MarkPrice { .. } => "mark_price",
-                    MarketPayload::IndexPrice { .. } => "index_price",
-                    MarketPayload::FundingRatePrediction { .. } => "funding_prediction",
-                    MarketPayload::FundingRateRealized { .. } => "funding_realized",
-                    MarketPayload::OpenInterest { .. } => "open_interest",
-                    MarketPayload::Liquidation { .. } => "liquidation",
-                    _ => "other_market",
-                };
-                *by_kind.entry(kind).or_default() += 1;
-            }
-            Payload::Control(c) => {
-                *by_kind.entry("control").or_default() += 1;
-                let desc = match c {
-                    ControlPayload::ConnUp { label } => format!("ConnUp {label}"),
-                    ControlPayload::ConnDown { label, reason } => {
-                        format!("ConnDown {label}: {reason}")
-                    }
-                    ControlPayload::SubAck { request_id, ok, .. } => {
-                        format!("SubAck id={request_id} ok={ok}")
-                    }
-                    other => format!("{other:?}"),
-                };
-                controls.push(format!("local_ts={} {desc}", event.local_ts));
-            }
-            _ => {
-                *by_kind.entry("other").or_default() += 1;
-            }
-        }
+    println!("=== {}", report.wal_file);
+    println!("total events: {}", report.events.total);
+    for (kind, n) in &report.events.by_kind {
+        println!("  {kind:.<24}{n}");
     }
-
-    println!("=== {path}");
-    println!("total events: {total}");
-    let mut kinds: Vec<_> = by_kind.iter().collect();
-    kinds.sort();
-    for (k, n) in kinds {
-        println!("  {k:.<24}{n}");
-    }
-    println!("reader stats: {:?}", reader.stats());
+    println!(
+        "frames: ok={} skipped_bytes={} resyncs={} undecodable={} truncated_tail={}",
+        report.frames.frames_ok,
+        report.frames.skipped_bytes,
+        report.frames.resyncs,
+        report.frames.undecodable_frames,
+        report.frames.truncated_tail,
+    );
 
     println!("\n=== control timeline");
-    for c in &controls {
-        println!("  {c}");
+    for line in &report.control.timeline {
+        println!("  {line}");
+    }
+    if report.control.timeline_truncated {
+        println!("  … truncated");
     }
 
     println!("\n=== depth verification");
-    let mut failures = 0;
-    let mut symbols_sorted: Vec<_> = symbols.iter().collect();
-    symbols_sorted.sort_by_key(|(s, _)| (*s).clone());
-    for (symbol, st) in symbols_sorted {
-        if st.updates == 0 && st.snapshots.is_empty() {
-            continue;
-        }
-        let unspliced: Vec<u64> = st
-            .spliced
-            .iter()
-            .filter(|(_, ok)| !**ok)
-            .map(|(id, _)| *id)
-            .collect();
-        let mut emt = st.e_minus_t_ns.clone();
-        emt.sort_unstable();
-        let p50 = emt.get(emt.len() / 2).copied().unwrap_or(0);
-        let p99 = emt.get(emt.len() * 99 / 100).copied().unwrap_or(0);
-
+    for (symbol, d) in &report.depth {
         println!(
-            "{symbol}: {} updates, {} snapshots, {} chain breaks, {} unspliced; E−T p50={}µs p99={}µs",
-            st.updates,
-            st.snapshots.len(),
-            st.chain_breaks.len(),
-            unspliced.len(),
-            p50 / 1_000,
-            p99 / 1_000,
+            "{symbol}: {} updates, {} snapshots, {} explained / {} unexplained breaks, \
+             {} unspliced, {} pending-at-eof, {} abandoned-by-reconnect{}",
+            d.updates,
+            d.snapshots,
+            d.chain_breaks_explained,
+            d.chain_breaks_unexplained,
+            d.unspliced_snapshots,
+            d.snapshots_pending_at_eof,
+            d.snapshots_abandoned_by_reconnect,
+            if d.missing_snapshot {
+                ", MISSING SNAPSHOT"
+            } else {
+                ""
+            },
         );
-        for b in &st.chain_breaks {
-            println!("    BREAK {b}");
-            failures += 1;
-        }
-        for id in &unspliced {
-            println!("    UNSPLICED snapshot lastUpdateId={id}");
-            failures += 1;
-        }
-        if st.updates > 0 && st.snapshots.is_empty() {
-            println!("    MISSING snapshot for symbol with depth updates");
-            failures += 1;
+    }
+    if let Some(e) = &report.latency_us.depth_e_minus_t {
+        println!(
+            "depth E−T: p50={}µs p99={}µs (n={})",
+            e.p50_us, e.p99_us, e.count
+        );
+    }
+    if !report.dups.is_empty() {
+        println!("\n=== sequence-id regressions (report-only)");
+        for (symbol, d) in &report.dups {
+            println!(
+                "{symbol}: trades explained={} unexplained={} ticker={}",
+                d.trade_id_regressions_explained,
+                d.trade_id_regressions_unexplained,
+                d.book_ticker_update_id_regressions,
+            );
         }
     }
 
-    if failures == 0 {
-        println!("\nACCEPTANCE: PASS (chain breaks outside reconnect windows: 0, all snapshots spliceable)");
-    } else {
-        println!("\nACCEPTANCE: {failures} finding(s) — match BREAKs against the control timeline; breaks inside reconnect windows are expected");
-        std::process::exit(1);
+    match report.status {
+        QaStatus::Pass => println!("\nACCEPTANCE: PASS"),
+        QaStatus::Fail => {
+            println!("\nACCEPTANCE: FAIL");
+            for f in &report.failures {
+                println!("  - {f}");
+            }
+            std::process::exit(1);
+        }
     }
 }

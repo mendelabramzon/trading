@@ -1,0 +1,34 @@
+# Binance USD-M capture config (one venue per process).
+#
+# Strict parsing: unknown fields are rejected; a data type the process cannot
+# actually capture fails validation at startup (exit code 2) instead of
+# producing silent zero-data.
+#
+# Not configurable today (validation rejects them, with the why):
+#   - mark_price / index_price / funding_rate: the fapi markPrice WS stream
+#     family is acked but emits nothing (live-verified 2026-06-10, raw tee +
+#     direct probes). Funding/mark/index capture lands with the Phase-2 REST
+#     poller (/fapi/v1/premiumIndex).
+#   - open_interest: REST-only on Binance (Phase-2 poller).
+#   - venue-wide book_ticker/book_depth/trade: no array streams exist
+#     (!bookTicker was removed from fapi).
+
+[venue]
+id = "binance"
+
+[paths]
+data_dir = "data"            # production: /var/lib/trading/data
+
+[logging]
+filter = "info"              # tracing EnvFilter syntax; RUST_LOG env overrides
+
+[capture]
+raw_tee = true               # R2 raw-frame tee -> data/raw/ (keep ON during bring-up)
+heartbeat_secs = 60          # P5d once-a-minute heartbeat log
+
+# Per-instrument streams: top-of-book + per-fill trades + full depth +
+# liquidations for the traded subset. `all = true` instead of `instruments`
+# subscribes venue-wide array streams (today: liquidation only).
+[[subscriptions]]
+instruments = ["btcusdt", "ethusdt"]
+data = ["book_ticker", "trade", "book_depth", "liquidation"]

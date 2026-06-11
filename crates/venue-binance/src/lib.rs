@@ -9,6 +9,7 @@ mod rest;
 mod ws_pool;
 
 use rest::FundingMap;
+pub use ws_pool::ExponentialBackoff;
 
 const BASE_REST_URL: &str = "https://fapi.binance.com";
 pub(crate) const BASE_WS_URL: &str = "wss://fstream.binance.com/ws";

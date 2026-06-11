@@ -1,6 +1,7 @@
 # Architecture: Trading Data Framework
 
-*Updated 2026-06-10 after the Phase-0 schema re-cut (wire v1 freeze). Sections
+*Updated 2026-06-11 after Phase 1 (unattended capture: config, venue-process,
+heartbeat, startup retry, hourly conversion + daily QA, systemd). Sections
 marked **[planned]** describe components that do not exist yet; everything else
 is implemented and tested.*
 
@@ -14,18 +15,19 @@ path. This dissolves the old "lossless to recorder vs consumers never block"
 contradiction: there is no recorder process behind the bus at all.
 
 ```
-  CAPTURE EDGE (one process per venue)                       [planned] LIVE PATH
+  CAPTURE EDGE (venue-process: one supervised process per venue)   [planned] LIVE PATH
  ┌──────────────────────────────────────────────┐
- │ venue-binance                                │            ┌───────────────┐
+ │ config.toml → venue-binance                  │            ┌───────────────┐
  │  WsPool (N conns, acks, stale watchdog) ──┐  │            │ event bus     │
  │  REST snapshot fetcher (paced) ───────────┤  │   lossy    │ (UDS, lossy,  │
  │  fundingInfo / exchangeInfo fetch ────────┤  │ ──────────>│  gap-counted) │
  │                                           ▼  │            └──────┬────────┘
- │            normalize → Event ── WalSink ──┬──│── data/wal/  (lossless)
+ │            normalize → Event ─ StatsSink ─┬──│── data/wal/  (lossless)
  │            raw frames ──── RawWalSink ────┴──│── data/raw/  (best-effort tee)
- └──────────────────────────────────────────────┘                   │
-                                                            [planned] strategy
- data/wal ──> parquet converter (manual today; hourly in Phase 1) ──> data/parquet/
+ │  heartbeat (1/min) ── journald               │                   │
+ └──────────────────────────────────────────────┘          [planned] strategy
+ data/wal ──> wal-sweep (hourly systemd timer) ──> data/parquet/<venue>/<date>/
+                                                     + qa_report.json (daily QA)
  data/parquet ──> [planned] replay (virtual clock) ──> same EventSink consumers
 ```
 
@@ -42,13 +44,16 @@ shipping WAL/Parquet files to other machines, never stretching the bus.
 | `venue-adapter`  | Traits (RPITIT, no async_trait): `EventSink` (+`send_batch`), `RawFrameSink`, `VenueAdapter<S>`, `Subscription{scope, data}`, `Scope`, `DataType`, `VenueError` |
 | `venue-binance`  | USD-M futures adapter: WsPool (sharding, ack watcher, stale watchdog, jittered backoff, control events, raw tee), REST depth-snapshot fetcher, fundingInfo/exchangeInfo fetch, parser fixture tests |
 | `wire`           | Framed MessagePack: `[magic "WAL1"][version u8][len u32][crc32][payload]`; self-healing `FrameReader`; golden-bytes + encoding-probe tests pin the layout |
-| `recorder`       | `WalWriter`/`WalSink` (lossless, dedicated thread, 1 s fsync, midnight rotation, fatal-exit on I/O error), `RawWalWriter` (R2 tee), Parquet converter (zstd, nullable columns, UTC-ns timestamps, 500K-row batches) |
+| `recorder`       | `WalWriter`/`WalSink` (lossless, dedicated thread, 1 s fsync, midnight rotation, fatal-exit on I/O error), `RawWalWriter` (R2 tee), `stats` (P5d counters: `StatsSink`, `WriterStats`), Parquet converter (zstd, nullable columns, UTC-ns timestamps, 500K-row batches), `qa` (daily QA report), `sweep` + `wal-sweep` bin (P6 conversion automation) |
+| `config`         | TOML capture config: strict parsing (`deny_unknown_fields`), validation that rejects data types the venue cannot deliver (silent zero-data → startup error), config→`Subscription` mapping |
+| `venue-process`  | Supervised capture binary: config → writers → adapter; startup retry with rollback (N8), once-a-minute heartbeat (P5d), daily exchangeInfo dump (P5a), SIGTERM/SIGINT graceful shutdown; exit codes 0/1/2 |
 
 ### Planned (per `report-fable-10062026.md` §6.3)
 
-`config` + `venue-process` (Phase 1), `backfill` (Phase 2), `symbology` registry
-build (Phase 2), `bus`/`transport` (Phase 3, or `iceoryx2`), `replay` (Phase 4),
-`strategy` (Phase 4), `execution` (Phase 6), `qa`/`ops` (Phase 3).
+`backfill` (Phase 2: REST pollers — funding/mark/index `premiumIndex`, OI,
+reconciliation), `symbology` registry build (Phase 2), `bus`/`transport`
+(Phase 3, or `iceoryx2`), `replay` (Phase 4), `strategy` (Phase 4), `execution`
+(Phase 6), manifest/lake (Phase 3).
 
 ### Dependency graph (actual)
 
@@ -57,6 +62,8 @@ venue-adapter  ─►  venue-core
 wire           ─►  venue-core
 venue-binance  ─►  venue-adapter, venue-core    (dev-dep: recorder, for examples)
 recorder       ─►  venue-adapter, venue-core, wire
+config         ─►  venue-adapter, venue-core
+venue-process  ─►  config, recorder, venue-binance, venue-adapter, venue-core
 ```
 
 `venue-adapter` deliberately does **not** depend on `wire`: adapters are
@@ -161,11 +168,28 @@ pub struct Subscription { pub scope: Scope, pub data: Vec<DataType> }
 pub enum Scope { Instruments(Vec<InstrumentId>), Class(InstrumentClass), All }
 ```
 
-`Scope::All` maps to venue-wide streams where they exist (Binance:
-`!markPrice@arr@1s`, `!forceOrder@arr`, `!bookTicker`) — one stream instead of
-hundreds, immune to listing lag. `Scope::Class` expansion waits for the
-Phase-2 universe manager. `DataType::OpenInterest` is REST-only on Binance and
-warn-skips until the Phase-2 poller.
+`Scope::All` maps to venue-wide streams where they exist — one stream instead
+of hundreds, immune to listing lag. `Scope::Class` expansion waits for the
+Phase-2 universe manager.
+
+**Live stream-availability findings (the acked-but-dead class).** Binance
+ACKs SUBSCRIBE for stream names that no longer emit, so silence — not an
+error — is the failure mode; the raw tee (R2) plus `ws_probe` is how these
+are diagnosed. Verified 2026-06-10:
+
+- fapi `@aggTrade` does not emit → `DataType::Trade` maps to `@trade`
+  (per-fill, carries fill type `X`); the aggTrade parser arm is a fallback.
+- **The whole `markPrice` stream family does not emit** (per-symbol and
+  `!markPrice@arr`, both cadences, raw and combined endpoints) →
+  mark/index/funding-prediction capture moves to the Phase-2 REST poller
+  (`/fapi/v1/premiumIndex`, verified live). The parser arms remain for a
+  venue-side revival.
+- `!bookTicker` was removed from fapi years ago.
+- `config` validation rejects all of these (plus REST-only
+  `DataType::OpenInterest`) at startup — a rejected SUBSCRIBE would
+  reconnect-loop forever, and an acked-dead one would capture nothing
+  silently. The only venue-wide stream currently allowed is
+  `!forceOrder@arr` (liquidations).
 
 ### Binance connection lifecycle (ws_pool)
 
@@ -191,25 +215,28 @@ One `read_loop` serves initial and reconnected sessions:
   30-min periodic sweep. Fetches are sequential, paced ≥0.5 s
   (`depth?limit=1000` = weight 20 vs the 2,400/min budget), deduplicated, with
   one retry. Snapshot `venue_ts` = response `T`, `source` = `SourceId::REST`.
-  Splice rule: apply updates with `U <= lastUpdateId <= u` onward; verified by
-  `recorder/examples/verify_depth.rs`.
+  Splice rule: the update continuing a snapshot satisfies
+  `U <= lastUpdateId + 1 <= u` (including the perfectly-contiguous
+  `U == lastUpdateId + 1`); checked daily by `recorder::qa` and on demand by
+  `recorder/examples/verify_depth.rs` (a thin CLI over the same code).
 - **Funding metadata** (A4): `/fapi/v1/fundingInfo` is fetched at subscribe
   time; `FundingRatePrediction` events carry `interval` (8h default for
   unlisted symbols — the endpoint lists only deviants) and venue clamps.
   `premium_index` stays `None` until its stream is captured.
 - **exchangeInfo dump** (P5a/N1): `fetch_instruments_raw()` returns the raw
-  JSON body; the process (today: the smoke example, Phase 1: venue-process)
-  writes it to `data/meta/binance/<date>-exchangeInfo.json` daily, so reference
-  fields the parser drops remain recoverable. `fetch_instruments` parses
-  tick/lot/notional filters, margin asset, delivery dates, lifecycle status and
-  funding intervals into the extended `Instrument`.
+  JSON body; `venue-process` writes it to
+  `data/meta/binance/<date>-exchangeInfo.json` at startup and on every UTC
+  date change (with a 30 s timeout and retry-next-minute on failure), so
+  reference fields the parser drops remain recoverable. `fetch_instruments`
+  parses tick/lot/notional filters, margin asset, delivery dates, lifecycle
+  status and funding intervals into the extended `Instrument`.
 
 ## 5. Recording Layer
 
 ```
-Events ─ WalSink ─> {data/wal}/{venue}/{date}.wal       (lossless, source of truth)
-Raw WS ─ RawWalSink ─> {data/raw}/{venue}/{date}.rawwal (best-effort tee, R2)
-WAL ──(manual `convert_wal` today; hourly automation lands in Phase 1 — P6)──> Parquet
+Events ─ StatsSink ─ WalSink ─> {data/wal}/{venue}/{date}.wal   (lossless, source of truth)
+Raw WS ─ RawWalSink ─> {data/raw}/{venue}/{date}.rawwal         (best-effort tee, R2)
+WAL ──(wal-sweep: hourly systemd timer, idempotent — P6)──> Parquet + qa_report.json
 ```
 
 - One dedicated OS thread per writer owns all file I/O; 100K-event channel
@@ -255,7 +282,94 @@ control:      instrument?, venue_ts?, local_ts, source, kind, detail(JSON)
 `Reference`/`Chain`/`Account` payloads are counted and logged, not yet
 converted. Conversion refuses files where >1% of bytes were corrupt (P1).
 
-## 6. Replay Layer **[planned — Phase 4]**
+## 6. Operations (Phase 1)
+
+### Running capture
+
+```
+cargo run -p venue-process -- configs/binance.toml      # dev
+systemctl enable --now trading-capture@binance          # deploy (see deploy/README.md)
+```
+
+One TOML per venue process (committed example: `configs/binance.toml`).
+Parsing is strict (`deny_unknown_fields`); validation rejects subscriptions
+the venue cannot deliver, and startup cross-checks configured instruments
+against live exchangeInfo — a typo'd symbol is exit 2, not silent zero-data.
+`RUST_LOG` overrides the config log filter.
+
+**Exit codes**: `0` clean signal shutdown · `1` fatal runtime (N2 WAL
+fatality; supervisor restarts) · `2` config/usage error (systemd
+`RestartPreventExitStatus=2` keeps it down — restarting cannot fix a config).
+
+**Startup retry (N8)**: a failed `subscribe()` can leave earlier stream
+chunks live, so venue-process rolls back with `disconnect()` and retries the
+whole subscription forever with capped jittered backoff (1 s→30 s) — an
+unattended box rides out long outages in-process. After subscribe succeeds,
+per-connection recovery is the WsPool's job. Config errors never retry.
+
+### Heartbeat (P5d)
+
+Once a minute (`capture.heartbeat_secs`), one log line from lock-free
+counters:
+
+```
+heartbeat venue=binance up_s=3600 total=39065
+  eps="book_ticker=537 book_update=19 trades=95"     events/s by kind since last beat ("idle" if none)
+  wal_depth=0 wal_written=39065 fsync_age_ms=396     WAL queue depth, frames written, age of last fsync
+  raw_depth=1 raw_dropped=0                          raw tee queue + drops (tee is best-effort)
+  reconnects=2                                       ConnDown count since start
+  staleness_s="book_ticker=0s liquidation=842s"      age of last event per kind ever seen
+```
+
+The heartbeat is the cheap detector for every silent-death mode (dead WAL
+thread → `fsync_age_ms` grows; zombie connection → `eps` idle + staleness
+grows; backpressure → `wal_depth` grows). Logs-only in Phase 1; rare kinds
+(liquidation) are legitimately stale for hours — thresholds and alerting are
+Phase-3 metrics work.
+
+### Conversion + daily QA (P6)
+
+`wal-sweep <wal_root> <out_root> [--as-of YYYY-MM-DD]` — hourly via systemd
+timer (`Persistent=true` catches downtime), manual-safe, idempotent:
+
+- Converts every `wal_root/<venue>/<date>.wal` with `date < as_of` (UTC
+  today by default). Open days and already-published days are skipped; a WAL
+  written <10 min ago is skipped (midnight-backlog guard).
+- Writes into `out/<venue>/.tmp-<date>/`, runs QA, writes `qa_report.json`
+  last, then publishes with one atomic rename to `out/<venue>/<date>/`.
+  **Completion marker = `qa_report.json` in the final dir**; marker-less
+  dirs are treated as partial and re-converted (Parquet is derived data).
+- A conversion failure still publishes the QA report
+  (`conversion.ok=false`, `status=fail`) so the day fails loudly instead of
+  retrying forever. Exit 1 if anything failed → the timer unit shows red.
+
+### QA report (schema_version 1, additive evolution)
+
+Per venue-day JSON, consumed by humans now and the Phase-3 manifest later:
+frame stats (corruption, resyncs, truncated tail), event totals by kind,
+per-instrument coverage (counts, first/last `local_ts`), depth QA, sequence
+regressions, control counts + timeline, latency histograms (`depth E−T` and
+`local_ts − venue_ts` per kind: p50/p95/p99/min/max, 1 ms-bucket histogram —
+conservative upper-edge percentiles).
+
+**Fail criteria (v1)**: corrupt bytes >1%; zero events; unexplained chain
+breaks; never-spliceable snapshots; depth updates with no snapshot all file;
+conversion error. **Explained-vs-unexplained**: a `ConnDown` recorded for
+the source feeding an instrument excuses the next chain break / trade-id
+regression there, and marks still-pending snapshots "abandoned by
+reconnect" — reconnect losses are visible but expected (A7); the same break
+on a healthy connection fails the day. Report-only in v1: trade/ticker id
+regressions, gap counts, latencies, snapshots pending at EOF (their splice
+lands in the next file).
+
+### Runbook
+
+See `deploy/README.md` for install, chrony prerequisite (`local_ts` is the
+replay merge clock), journald commands, and what to do on a failing QA
+report (read `failures[]`, match against `control.timeline`, delete the
+day's output dir to re-convert after investigation).
+
+## 7. Replay Layer **[planned — Phase 4]**
 
 Contracts already settled, recorded here so the implementation cannot drift:
 
@@ -272,7 +386,7 @@ Contracts already settled, recorded here so the implementation cannot drift:
 - Inputs come from the manifest with QA status (R10, Phase 3); replaying
   unaudited data at minimum warns loudly.
 
-## 7. Event Bus **[planned — Phase 3]**
+## 8. Event Bus **[planned — Phase 3]**
 
 Lossy-only, gap-counted, restart-tolerant; spec'd in one page before building
 (A10), or `iceoryx2` adopted instead. With the WAL at the edge the bus has no
@@ -280,7 +394,7 @@ durability requirement — never build lossless consumer backpressure. Slow
 consumers get drops plus `Control::Gap{reason, dropped}` injections. Private
 `Account` events never transit the shared bus (A13).
 
-## 8. Scalability and Performance
+## 9. Scalability and Performance
 
 The numbers below are **design targets, not measurements** (DOC4); the latency
 roadmap is deliberately frozen at UDS-class transport (A1) — at a seconds-scale

@@ -3,13 +3,19 @@ use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc};
 use std::thread;
 use std::time::{Duration, Instant};
 use venue_adapter::{EventSink, EventSinkError, RawFrameSink};
 use venue_core::{Event, Nanos, RawFrame};
 
 pub mod parquet_converter;
+pub mod qa;
+pub mod stats;
+pub mod sweep;
+
+pub use qa::{qa_wal, QaReport, QaStatus};
+pub use stats::{CaptureStats, EventKind, StatsSink, WriterStats};
 
 const FSYNC_INTERVAL: Duration = Duration::from_secs(1);
 
@@ -39,8 +45,13 @@ fn nanos_to_date(nanos: Nanos) -> NaiveDate {
 /// venue/day append files, 1 s fsync cadence, midnight rotation, fatal-exit on
 /// I/O errors. `route` extracts the (venue, local_ts) routing key from a
 /// record; records are framed by `wire::encode_frame`.
-fn run_wal_loop<T, F>(base_dir: PathBuf, extension: &str, rx: mpsc::Receiver<T>, route: F)
-where
+fn run_wal_loop<T, F>(
+    base_dir: PathBuf,
+    extension: &str,
+    rx: mpsc::Receiver<T>,
+    route: F,
+    stats: Arc<WriterStats>,
+) where
     T: serde::Serialize,
     F: Fn(&T) -> (String, Nanos),
 {
@@ -57,6 +68,7 @@ where
         };
 
         if let Some(record) = record {
+            stats.record_dequeued();
             // File date comes from local_ts (capture truth): files are
             // arrival-ordered and venue clocks must not pick the file.
             let (venue, local_ts) = route(&record);
@@ -86,6 +98,8 @@ where
                 tracing::warn!(error = ?e, "wire encode failed, record dropped");
             } else if let Err(e) = writer.write_all(&buf) {
                 fatal_io("write WAL frame", &e);
+            } else {
+                stats.record_written();
             }
         }
 
@@ -93,11 +107,13 @@ where
             fsync_all(&mut writers);
             rotate(&mut writers);
             last_fsync = Instant::now();
+            stats.record_fsync();
         }
     }
 
     // Channel disconnected — flush and sync everything.
     fsync_all(&mut writers);
+    stats.record_fsync();
     tracing::info!("WAL writer thread exiting cleanly");
 }
 
@@ -131,21 +147,33 @@ fn rotate(writers: &mut HashMap<(String, NaiveDate), BufWriter<File>>) {
 pub struct WalWriter {
     tx: Option<mpsc::SyncSender<Event>>,
     handle: Option<thread::JoinHandle<()>>,
+    stats: Arc<WriterStats>,
 }
 
 impl WalWriter {
     pub fn new(base_dir: PathBuf) -> Self {
-        let (tx, rx) = mpsc::sync_channel::<Event>(CHANNEL_CAPACITY);
+        Self::with_capacity(base_dir, CHANNEL_CAPACITY)
+    }
 
+    pub(crate) fn with_capacity(base_dir: PathBuf, capacity: usize) -> Self {
+        let (tx, rx) = mpsc::sync_channel::<Event>(capacity);
+        let stats = Arc::new(WriterStats::default());
+
+        let loop_stats = Arc::clone(&stats);
         let handle = thread::spawn(move || {
-            run_wal_loop(base_dir, "wal", rx, |event: &Event| {
-                (event.venue.value.to_string(), event.local_ts)
-            });
+            run_wal_loop(
+                base_dir,
+                "wal",
+                rx,
+                |event: &Event| (event.venue.value.to_string(), event.local_ts),
+                loop_stats,
+            );
         });
 
         Self {
             tx: Some(tx),
             handle: Some(handle),
+            stats,
         }
     }
 
@@ -153,8 +181,15 @@ impl WalWriter {
         if let Some(tx) = &self.tx {
             if tx.send(event.clone()).is_err() {
                 tracing::warn!("WAL event dropped: writer thread gone");
+            } else {
+                self.stats.record_enqueued();
             }
         }
+    }
+
+    /// Heartbeat counters for this writer (queue depth, written, fsync age).
+    pub fn stats(&self) -> Arc<WriterStats> {
+        Arc::clone(&self.stats)
     }
 
     /// An `EventSink` handle feeding this writer. Clones share the channel.
@@ -168,6 +203,7 @@ impl WalWriter {
                 .tx
                 .clone()
                 .expect("WalWriter::sink called after shutdown"),
+            stats: Arc::clone(&self.stats),
         }
     }
 }
@@ -196,16 +232,21 @@ impl Drop for WalWriter {
 #[derive(Clone)]
 pub struct WalSink {
     tx: mpsc::SyncSender<Event>,
+    stats: Arc<WriterStats>,
 }
 
 impl WalSink {
     fn send_sync(&self, event: Event) -> Result<(), EventSinkError> {
         match self.tx.try_send(event) {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                self.stats.record_enqueued();
+                Ok(())
+            }
             Err(mpsc::TrySendError::Full(event)) => {
                 tracing::warn!("WAL channel full; backpressuring capture");
                 tokio::task::block_in_place(|| self.tx.send(event))
                     .map_err(|_| EventSinkError::Closed)
+                    .inspect(|()| self.stats.record_enqueued())
             }
             Err(mpsc::TrySendError::Disconnected(_)) => Err(EventSinkError::Closed),
         }
@@ -233,23 +274,40 @@ impl EventSink for WalSink {
 pub struct RawWalWriter {
     tx: Option<mpsc::SyncSender<RawFrame>>,
     handle: Option<thread::JoinHandle<()>>,
+    stats: Arc<WriterStats>,
 }
 
 impl RawWalWriter {
     pub fn new(base_dir: PathBuf, venue: &str) -> Self {
-        let venue = venue.to_string();
-        let (tx, rx) = mpsc::sync_channel::<RawFrame>(CHANNEL_CAPACITY);
+        Self::with_capacity(base_dir, venue, CHANNEL_CAPACITY)
+    }
 
+    pub(crate) fn with_capacity(base_dir: PathBuf, venue: &str, capacity: usize) -> Self {
+        let venue = venue.to_string();
+        let (tx, rx) = mpsc::sync_channel::<RawFrame>(capacity);
+        let stats = Arc::new(WriterStats::default());
+
+        let loop_stats = Arc::clone(&stats);
         let handle = thread::spawn(move || {
-            run_wal_loop(base_dir, "rawwal", rx, move |frame: &RawFrame| {
-                (venue.clone(), frame.local_ts)
-            });
+            run_wal_loop(
+                base_dir,
+                "rawwal",
+                rx,
+                move |frame: &RawFrame| (venue.clone(), frame.local_ts),
+                loop_stats,
+            );
         });
 
         Self {
             tx: Some(tx),
             handle: Some(handle),
+            stats,
         }
+    }
+
+    /// Heartbeat counters for this writer (queue depth, written, drops).
+    pub fn stats(&self) -> Arc<WriterStats> {
+        Arc::clone(&self.stats)
     }
 
     /// A `RawFrameSink` handle for adapters. Same shutdown contract as
@@ -260,6 +318,7 @@ impl RawWalWriter {
                 .tx
                 .clone()
                 .expect("RawWalWriter::sink called after shutdown"),
+            stats: Arc::clone(&self.stats),
         }
     }
 }
@@ -281,12 +340,20 @@ impl Drop for RawWalWriter {
 #[derive(Clone)]
 pub struct RawWalSink {
     tx: mpsc::SyncSender<RawFrame>,
+    stats: Arc<WriterStats>,
 }
 
 impl RawFrameSink for RawWalSink {
     fn send_raw(&self, frame: RawFrame) {
-        if let Err(mpsc::TrySendError::Full(_)) = self.tx.try_send(frame) {
-            tracing::warn!("raw WAL channel full; raw frame dropped (normalized WAL unaffected)");
+        match self.tx.try_send(frame) {
+            Ok(()) => self.stats.record_enqueued(),
+            Err(mpsc::TrySendError::Full(_)) => {
+                self.stats.record_dropped();
+                tracing::warn!(
+                    "raw WAL channel full; raw frame dropped (normalized WAL unaffected)"
+                );
+            }
+            Err(mpsc::TrySendError::Disconnected(_)) => {}
         }
     }
 }
@@ -446,6 +513,44 @@ mod tests {
             count += 1;
         }
         assert_eq!(count, 3);
+    }
+
+    #[test]
+    fn test_writer_stats_counts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let writer = WalWriter::new(tmp.path().to_path_buf());
+        let stats = writer.stats();
+
+        for i in 0..5 {
+            writer.send(&make_event(i, 1_700_000_000_000_000_000 + i));
+        }
+        drop(writer); // joins the thread: everything dequeued, written, fsynced
+
+        assert_eq!(stats.written(), 5);
+        assert_eq!(stats.queue_depth(), 0);
+        assert!(stats.fsync_age().is_some());
+    }
+
+    #[test]
+    fn test_raw_sink_counts_drops_on_full_channel() {
+        // Deterministic full-channel: capacity-1 channel with no consumer.
+        let (tx, _rx) = mpsc::sync_channel::<RawFrame>(1);
+        let stats = Arc::new(WriterStats::default());
+        let sink = RawWalSink {
+            tx,
+            stats: Arc::clone(&stats),
+        };
+
+        let frame = RawFrame {
+            local_ts: 1,
+            source: SourceId(1),
+            bytes: vec![1, 2, 3],
+        };
+        sink.send_raw(frame.clone()); // fills the channel
+        sink.send_raw(frame); // dropped
+
+        assert_eq!(stats.queue_depth(), 1);
+        assert_eq!(stats.dropped(), 1);
     }
 
     #[test]

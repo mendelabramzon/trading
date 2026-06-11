@@ -1,0 +1,13 @@
+# One-shot WAL -> Parquet conversion + daily QA report (P6).
+# Driven by trading-wal-sweep.timer; safe to run manually any time
+# (idempotent: completion marker = qa_report.json per venue-day).
+[Unit]
+Description=Convert rotated WALs to Parquet + daily QA report
+
+[Service]
+Type=oneshot
+User=trading
+WorkingDirectory=/var/lib/trading
+ExecStart=/opt/trading/bin/wal-sweep data/wal data/parquet
+# Non-zero exit (QA fail or conversion error) leaves the unit failed —
+# visible in `systemctl list-units --failed` and journald.
