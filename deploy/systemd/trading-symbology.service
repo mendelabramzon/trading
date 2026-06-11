@@ -1,0 +1,12 @@
+# Daily reference-data build: canonical symbology mapping (A3), instruments
+# SCD (A11), fee schedules — all rebuilt deterministically from the day's
+# dumps and configs; atomic publish into data/meta/.
+[Unit]
+Description=Daily symbology / instruments-SCD / fees build
+
+[Service]
+Type=oneshot
+User=trading
+WorkingDirectory=/var/lib/trading
+ExecStart=/opt/trading/bin/symbology build --data-dir data \
+  --overrides /etc/trading/symbology-overrides.toml --fees-dir /etc/trading/fees

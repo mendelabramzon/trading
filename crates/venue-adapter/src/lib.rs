@@ -1,6 +1,9 @@
 use std::future::Future;
 use venue_core::{Event, Instrument, InstrumentClass, InstrumentId, RawFrame, VenueId};
 
+mod source;
+pub use source::{IngestSource, SourceSet};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DataType {
     BookTicker,

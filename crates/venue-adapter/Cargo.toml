@@ -8,4 +8,9 @@
 
   [dependencies]
   venue-core = { path = "../venue-core" }
-  tokio = { workspace = true, features = ["sync"] }
+  tokio = { workspace = true, features = ["sync", "rt", "time"] }
+  tokio-util = { workspace = true }
+  tracing = { workspace = true }
+
+  [dev-dependencies]
+  tokio = { workspace = true, features = ["rt-multi-thread", "macros", "test-util"] }

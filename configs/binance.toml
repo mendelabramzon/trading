@@ -4,12 +4,16 @@
 # actually capture fails validation at startup (exit code 2) instead of
 # producing silent zero-data.
 #
-# Not configurable today (validation rejects them, with the why):
-#   - mark_price / index_price / funding_rate: the fapi markPrice WS stream
-#     family is acked but emits nothing (live-verified 2026-06-10, raw tee +
-#     direct probes). Funding/mark/index capture lands with the Phase-2 REST
-#     poller (/fapi/v1/premiumIndex).
-#   - open_interest: REST-only on Binance (Phase-2 poller).
+# Capture paths per data type:
+#   - book_ticker / trade / book_depth / liquidation: WS streams,
+#     per-instrument (liquidation also venue-wide via `all = true`).
+#   - mark_price / index_price / funding_rate: the fapi markPrice WS family is
+#     acked but emits nothing (live-verified 2026-06-10), so these come from
+#     the venue-wide /fapi/v1/premiumIndex REST poller — `all = true` only.
+#     funding_rate additionally runs the /fapi/v1/fundingRate tail poller
+#     (realized funding events, the coverage SLO input).
+#   - open_interest: REST-only on Binance; per-symbol poller sweep. Explicit
+#     instruments = those symbols; `all = true` = the whole perp universe.
 #   - venue-wide book_ticker/book_depth/trade: no array streams exist
 #     (!bookTicker was removed from fapi).
 
@@ -26,9 +30,19 @@ filter = "info"              # tracing EnvFilter syntax; RUST_LOG env overrides
 raw_tee = true               # R2 raw-frame tee -> data/raw/ (keep ON during bring-up)
 heartbeat_secs = 60          # P5d once-a-minute heartbeat log
 
+[pollers]                    # REST poller cadences, seconds (bounds: 5..=3600)
+premium_index_secs = 30      # mark/index/funding prediction, all symbols per call
+open_interest_secs = 300     # one full perp-universe OI sweep per interval
+funding_realized_secs = 300  # realized-funding tail poll (dedup + catch-up inside)
+
 # Per-instrument streams: top-of-book + per-fill trades + full depth +
-# liquidations for the traded subset. `all = true` instead of `instruments`
-# subscribes venue-wide array streams (today: liquidation only).
+# liquidations for the traded subset.
 [[subscriptions]]
 instruments = ["btcusdt", "ethusdt"]
 data = ["book_ticker", "trade", "book_depth", "liquidation"]
+
+# Venue-wide capture (A14 tiering: funding/mark/OI for ALL perps; depth only
+# for the traded subset above).
+[[subscriptions]]
+all = true
+data = ["funding_rate", "mark_price", "index_price", "open_interest"]

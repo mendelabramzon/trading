@@ -1,0 +1,19 @@
+# Curated symbology exceptions (A3): rows here patch or drop the derived
+# (venue, instrument) -> canonical mapping. Strict parsing — unknown fields
+# are rejected at build time.
+#
+#   [[override]]
+#   venue = "binance"
+#   instrument = "someusdt"
+#   exclude = true            # drop from the mapping entirely
+#   # OR patch canonical fields (origin becomes "override"):
+#   # base = "1000SHIB"
+#   # quote = "USDT"
+#   # settle = "USDT"
+
+# Index products are not coin perps; keep them out of cross-venue joins
+# until a deliberate decision says otherwise.
+[[override]]
+venue = "binance"
+instrument = "btcdomusdt"
+exclude = true

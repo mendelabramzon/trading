@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily reference-data build at 04:00 UTC
+
+[Timer]
+# After the day's first exchangeInfo/fundingInfo dumps and the OI backfill.
+OnCalendar=*-*-* 04:00:00 UTC
+Persistent=true
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target

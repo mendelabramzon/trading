@@ -1,5 +1,5 @@
   [package]
-  name = "venue-process"
+  name = "symbology"
   version = "0.1.0"
   edition = "2021"
 
@@ -7,17 +7,17 @@
   workspace = true
 
   [dependencies]
-  config = { path = "../config" }
   recorder = { path = "../recorder" }
-  venue-adapter = { path = "../venue-adapter" }
-  venue-binance = { path = "../venue-binance" }
   venue-core = { path = "../venue-core" }
+  arrow = { workspace = true }
   chrono = { workspace = true }
+  parquet = { workspace = true }
+  serde = { workspace = true }
   serde_json = { workspace = true }
-  tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal", "time", "sync"] }
+  toml = { workspace = true }
   tracing = { workspace = true }
+  # bin only; the library does not init subscribers.
   tracing-subscriber = { workspace = true }
 
   [dev-dependencies]
-  rust_decimal = { workspace = true }
   tempfile = { workspace = true }

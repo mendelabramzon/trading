@@ -4,12 +4,18 @@ Event-driven market data infrastructure for collecting, recording, and replaying
 data from multiple venues. Built for strategy development and live trading.
 
 **Status (2026-06-11):** single-venue capture is real, hardened, and
-**unattended** (Phase 1 complete) — Binance USD-M futures → framed WAL
-(+ raw-frame tee) → zstd Parquet with a daily QA report, run from a TOML
-config under systemd with startup retry, heartbeat, and hourly conversion
-(see `docs/report-fable-10062026.md` §7). The event bus, replay, and strategy
-layers are designed but **not built yet**; diagrams below mark them
-*(planned)*.
+**unattended** (Phase 1), and the completeness/reference layer is in
+(Phase 2) — Binance USD-M futures → framed WAL (+ raw-frame tee) → zstd
+Parquet with a daily QA report, run from a TOML config under systemd; REST
+pollers capture funding/mark/index/OI (the venue's markPrice WS family is
+dead); `backfill` holds multi-year funding history for **Binance and Bybit**
+plus the perishable 30-day OI history; a daily reconciler tracks the
+funding-coverage SLO (`consecutive_green_days`); `symbology` builds the
+canonical cross-venue mapping, instruments SCD, and fee schedules. The
+consumer contract for all datasets is `docs/data-products.md` — research
+notebooks and strategy code live in separate repositories. The event bus,
+replay, and strategy layers are designed but **not built yet**; diagrams
+below mark them *(planned)*.
 
 ## Architecture
 
@@ -23,7 +29,7 @@ graph LR
     subgraph Venue ["Venue Process (built: Binance)"]
         direction TB
         WS[WsPool<br/><i>acks · stale watchdog · reconnect</i>]
-        REST[REST<br/><i>depth snapshots · fundingInfo</i>]
+        REST[REST<br/><i>depth snapshots · pollers: premiumIndex / OI / fundingRate · universe diff</i>]
         WAL[("data/wal/*.wal<br/>data/raw/*.rawwal")]
         WS --> WAL
         REST --> WAL
@@ -113,12 +119,13 @@ events through the same sink.
 |-------|--------|---------|
 | `venue-core` | built | Envelope v2, domain payloads, symbology types (`Asset`, `InstrumentClass`, `CanonicalInstrumentId`), `SourceId`, `Provenance`, `RawFrame` |
 | `venue-adapter` | built | Traits (RPITIT): `EventSink` (+`send_batch`), `RawFrameSink`, `VenueAdapter<S>`, `Subscription{scope,data}` |
-| `venue-binance` | built | Binance USD-M adapter: WsPool, REST snapshot fetcher, fundingInfo, exchangeInfo dump, fixture tests |
+| `venue-binance` | built | Binance USD-M adapter: WsPool, REST snapshot fetcher, Phase-2 REST pollers (premiumIndex/OI/fundingRate — the WS markPrice family is dead on fapi), fundingInfo, exchangeInfo dump, fixture tests |
 | `wire` | built | Framed MessagePack (`magic/version/len/crc32`), self-healing `FrameReader`, golden-bytes layout pin |
-| `recorder` | built | `WalWriter`/`WalSink`, `RawWalWriter`, capture stats (heartbeat counters), zstd Parquet converter, QA module, `wal-sweep` bin, acceptance checker (`verify_depth`) |
-| `config` | built | Strict TOML capture config; rejects subscriptions the venue can't deliver |
-| `venue-process` | built | Unattended supervised capture entrypoint: startup retry, heartbeat, daily exchangeInfo dump, graceful shutdown |
-| `backfill` / `symbology` | planned (Phase 2) | REST history + reconciliation (incl. funding/mark via `premiumIndex` — the WS markPrice family is dead on fapi); canonical instrument registry |
+| `recorder` | built | `WalWriter`/`WalSink`, `RawWalWriter`, capture stats (heartbeat counters), shared Parquet table writers (`tables`), zstd converter (incl. `reference.parquet`), QA module, `wal-sweep` bin, acceptance checker (`verify_depth`) |
+| `config` | built | Strict TOML capture config; rejects subscriptions the venue can't deliver; `[pollers]` cadences, `[universe]` policy |
+| `venue-process` | built | Unattended supervised capture entrypoint: startup retry, heartbeat, daily exchangeInfo + fundingInfo dumps, universe manager (lifecycle → `Reference` events, auto-subscribe), graceful shutdown |
+| `backfill` | built | REST history (Binance + Bybit funding, OI history, klines) + daily funding reconciler with the 14-day coverage criterion |
+| `symbology` | built | Canonical mapping + point-in-time `Registry`, instruments SCD, fee schedules; `symbology build` bin |
 | `bus` / `replay` / `strategy` / `execution` | planned (Phases 3–6) | See `docs/report-fable-10062026.md` §7 roadmap |
 
 ## Quick start
@@ -130,10 +137,21 @@ cargo run -p venue-process -- configs/binance.toml
 # Convert closed days + daily QA report (idempotent; hourly via systemd in deploy):
 cargo run -p recorder --bin wal-sweep -- data/wal data/parquet
 
+# REST history + daily coverage check (idempotent; timers in deploy):
+cargo run -p backfill --bin backfill -- funding --venue binance
+cargo run -p backfill --bin backfill -- funding --venue bybit --from 2023-01
+cargo run -p backfill --bin backfill -- oi-hist --venue binance
+cargo run -p backfill --bin backfill -- reconcile --venue binance --date <date>
+
+# Reference data (canonical mapping + instruments SCD + fees):
+cargo run -p symbology --bin symbology -- build
+
 # Inspect:
 cargo run -p recorder --example read_wal data/wal/binance/<date>.wal
 cargo run -p recorder --example verify_depth data/wal/binance/<date>.wal   # QA gate, on demand
+cargo run -p symbology --example spread_check                             # cross-venue joinability demo
 cat data/parquet/binance/<date>/qa_report.json
+cat data/meta/reconciliation/binance/<date>.json
 ```
 
 Deployment (systemd units, chrony prerequisite, runbook): `deploy/README.md`.

@@ -2,7 +2,11 @@
 //! visible — per-kind event rates, WAL queue depth, fsync age, raw-tee drops,
 //! reconnect count, per-kind staleness. Logs-only in Phase 1: the heartbeat
 //! informs, the reader judges (rare kinds like liquidation are legitimately
-//! stale for hours on quiet markets).
+//! stale for hours on quiet markets; funding_realized up to its interval +
+//! poll cadence). Per-kind staleness is also the per-poller detector: every
+//! REST poller owns distinct kinds (mark/index/funding_prediction = premium
+//! index, funding_realized, open_interest), while SourceId can't tell REST
+//! sources apart (all 0 by the frozen wire-v1 convention).
 
 use recorder::{CaptureStats, EventKind, WriterStats};
 use std::fmt::Write as _;

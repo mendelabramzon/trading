@@ -7,6 +7,8 @@
     "crates/recorder",
     "crates/config",
     "crates/venue-process",
+    "crates/backfill",
+    "crates/symbology",
   ]
   resolver = "2"
 

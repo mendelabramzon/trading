@@ -1,0 +1,11 @@
+# Binance USD-M futures fee schedule (public default tier). Fractions, not
+# percent: 0.0002 = 2.0 bps. BNB-discount variants (-10%) deliberately not
+# modeled in v1 — add a "vip0_bnb" tier row if a strategy assumes it.
+# valid_from marks when the schedule applied; append rows on change, never
+# rewrite history.
+[[schedule]]
+valid_from = "2026-01-01"
+tier = "vip0"
+market = "usdm_perp"
+maker = "0.0002"
+taker = "0.0005"

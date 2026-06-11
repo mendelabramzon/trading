@@ -1,0 +1,12 @@
+[Unit]
+Description=Daily OI-history backfill at 03:30 UTC
+
+[Timer]
+# After the reconciler (02:30); both are paced batch jobs sharing the IP
+# weight budget with live capture.
+OnCalendar=*-*-* 03:30:00 UTC
+Persistent=true
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target

@@ -5,9 +5,11 @@ use tokio::net::TcpStream;
 use tokio_tungstenite::{tungstenite::Message, MaybeTlsStream, WebSocketStream};
 use venue_adapter::*;
 use venue_core::*;
+mod pollers;
 mod rest;
 mod ws_pool;
 
+pub use pollers::{PollerCfg, Universe};
 use rest::FundingMap;
 pub use ws_pool::ExponentialBackoff;
 
@@ -165,6 +167,15 @@ struct ForceOrderDetail {
     time: u64, // trade time (ms)
 }
 
+/// Which REST pollers this adapter already runs — incremental `subscribe`
+/// calls (the universe manager's auto-subscribe) must not duplicate them.
+#[derive(Default)]
+struct RunningPollers {
+    premium: bool,
+    realized: bool,
+    open_interest: bool,
+}
+
 pub struct BinanceAdapter<S: EventSink, R: RawFrameSink = ()> {
     venue_id: VenueId,
     sink: S,
@@ -174,7 +185,14 @@ pub struct BinanceAdapter<S: EventSink, R: RawFrameSink = ()> {
     snapshot_fetcher: Option<(
         tokio_util::sync::CancellationToken,
         tokio::task::JoinHandle<()>,
+        tokio::sync::mpsc::Sender<rest::SnapshotRequest>,
     )>,
+    poller_cfg: PollerCfg,
+    /// Live universe feed for the OI poller (wired by the venue process once
+    /// the universe manager runs); absent → one static snapshot at subscribe.
+    universe: Option<tokio::sync::watch::Receiver<Universe>>,
+    sources: SourceSet,
+    running: RunningPollers,
 }
 
 impl<S: EventSink> BinanceAdapter<S> {
@@ -188,6 +206,10 @@ impl<S: EventSink> BinanceAdapter<S> {
             pool: ws_pool::WsPool::new(MAX_STREAMS_PER_CONN),
             next_id: 0,
             snapshot_fetcher: None,
+            poller_cfg: PollerCfg::default(),
+            universe: None,
+            sources: SourceSet::new(),
+            running: RunningPollers::default(),
         }
     }
 }
@@ -203,7 +225,33 @@ impl<S: EventSink, R: RawFrameSink> BinanceAdapter<S, R> {
             pool: self.pool,
             next_id: self.next_id,
             snapshot_fetcher: self.snapshot_fetcher,
+            poller_cfg: self.poller_cfg,
+            universe: self.universe,
+            sources: self.sources,
+            running: self.running,
         }
+    }
+
+    /// Override the REST poller cadences (config `[pollers]`).
+    pub fn with_poller_cfg(mut self, cfg: PollerCfg) -> Self {
+        self.poller_cfg = cfg;
+        self
+    }
+
+    /// Attach a live universe feed for the open-interest sweep. Without it,
+    /// an `OpenInterest` + `Scope::All` subscription falls back to a static
+    /// snapshot of TRADING perps taken at subscribe time.
+    pub fn with_universe(mut self, rx: tokio::sync::watch::Receiver<Universe>) -> Self {
+        self.universe = Some(rx);
+        self
+    }
+
+    /// The raw fundingInfo body (intervals/clamps), for the daily meta dump:
+    /// interval *history* feeds the instruments SCD; the in-process map only
+    /// holds "now". File I/O stays with the venue process, as with
+    /// `fetch_instruments_raw`.
+    pub async fn fetch_funding_info_raw(&self) -> Result<String, VenueError> {
+        rest::fetch_funding_info_raw().await.map(|(raw, _)| raw)
     }
 
     /// `fetch_instruments` plus the raw exchangeInfo body (P5a): callers
@@ -211,6 +259,23 @@ impl<S: EventSink, R: RawFrameSink> BinanceAdapter<S, R> {
     /// drops today stays recoverable. File I/O deliberately stays out of the
     /// adapter; the venue process owns the dump location.
     pub async fn fetch_instruments_raw(&self) -> Result<(String, Vec<Instrument>), VenueError> {
+        let (text, all) = self.fetch_exchange_info().await?;
+        let instruments = all
+            .into_iter()
+            .filter(|i| i.lifecycle == LifecycleState::Trading)
+            .collect();
+        Ok((text, instruments))
+    }
+
+    /// Every listed symbol regardless of status — the universe manager's
+    /// input (lifecycle transitions like SETTLING/DELIVERED are exactly what
+    /// it must observe; `fetch_instruments` keeps its TRADING-only contract
+    /// for validation).
+    pub async fn fetch_instruments_all(&self) -> Result<Vec<Instrument>, VenueError> {
+        self.fetch_exchange_info().await.map(|(_, all)| all)
+    }
+
+    async fn fetch_exchange_info(&self) -> Result<(String, Vec<Instrument>), VenueError> {
         let url = format!("{}/fapi/v1/exchangeInfo", BASE_REST_URL);
         let text = reqwest::get(&url)
             .await
@@ -229,7 +294,6 @@ impl<S: EventSink, R: RawFrameSink> BinanceAdapter<S, R> {
         let instruments = resp
             .symbols
             .into_iter()
-            .filter(|s| s.status == "TRADING")
             .map(|s| symbol_to_instrument(s, &funding))
             .collect();
 
@@ -254,8 +318,16 @@ impl<S: EventSink, R: RawFrameSink> VenueAdapter<S> for BinanceAdapter<S, R> {
 
     async fn subscribe(&mut self, subscriptions: Vec<Subscription>) -> Result<(), VenueError> {
         // Build deduplicated streams (e.g. FundingRate/MarkPrice/IndexPrice all
-        // ride one @markPrice stream).
+        // ride one @markPrice stream) and collect the REST-poller wants. The
+        // markPrice WS family is acked-but-dead (live-verified 2026-06-10), so
+        // its streams stay subscribed only as a free fallback — the pollers
+        // are the real producers; a revived WS stream would be
+        // distinguishable by source (WS ≥ 1, REST = 0).
         let mut streams = std::collections::HashSet::new();
+        let mut want_premium = false;
+        let mut want_realized = false;
+        let mut want_oi_all = false;
+        let mut oi_static: Vec<std::sync::Arc<str>> = Vec::new();
         for sub in &subscriptions {
             match &sub.scope {
                 Scope::Instruments(ids) => {
@@ -278,16 +350,19 @@ impl<S: EventSink, R: RawFrameSink> VenueAdapter<S> for BinanceAdapter<S, R> {
                                 | DataType::MarkPrice
                                 | DataType::IndexPrice => {
                                     streams.insert(format!("{symbol}@markPrice@1s"));
+                                    // The premium-index poller is venue-wide;
+                                    // a per-instrument ask still gets (at
+                                    // least) its symbols.
+                                    want_premium = true;
+                                    if matches!(dt, DataType::FundingRate) {
+                                        want_realized = true;
+                                    }
                                 }
                                 DataType::Liquidation => {
                                     streams.insert(format!("{symbol}@forceOrder"));
                                 }
                                 DataType::OpenInterest => {
-                                    tracing::warn!(
-                                        %symbol,
-                                        "OpenInterest is REST-only on Binance; \
-                                         captured by the Phase-2 poller — skipped"
-                                    );
+                                    oi_static.push(id.value.clone());
                                 }
                             }
                         }
@@ -301,9 +376,16 @@ impl<S: EventSink, R: RawFrameSink> VenueAdapter<S> for BinanceAdapter<S, R> {
                             }
                             DataType::FundingRate | DataType::MarkPrice | DataType::IndexPrice => {
                                 streams.insert("!markPrice@arr@1s".to_string());
+                                want_premium = true;
+                                if matches!(dt, DataType::FundingRate) {
+                                    want_realized = true;
+                                }
                             }
                             DataType::Liquidation => {
                                 streams.insert("!forceOrder@arr".to_string());
+                            }
+                            DataType::OpenInterest => {
+                                want_oi_all = true;
                             }
                             other => {
                                 tracing::warn!(
@@ -333,18 +415,24 @@ impl<S: EventSink, R: RawFrameSink> VenueAdapter<S> for BinanceAdapter<S, R> {
         });
 
         // Depth snapshots (Bug 1): one fetcher task per adapter, triggered by
-        // the first depthUpdate per symbol per connection session.
+        // the first depthUpdate per symbol per connection session. One
+        // fetcher per adapter: incremental subscribe calls reuse its queue.
         let snapshot_tx = if streams.iter().any(|s| s.contains("@depth")) {
-            let cancel = tokio_util::sync::CancellationToken::new();
-            let (tx, handle) = rest::spawn_snapshot_fetcher(
-                self.sink.clone(),
-                self.venue_id.clone(),
-                cancel.clone(),
-            );
-            self.snapshot_fetcher = Some((cancel, handle));
-            Some(tx)
+            match &self.snapshot_fetcher {
+                Some((_, _, tx)) => Some(tx.clone()),
+                None => {
+                    let cancel = tokio_util::sync::CancellationToken::new();
+                    let (tx, handle) = rest::spawn_snapshot_fetcher(
+                        self.sink.clone(),
+                        self.venue_id.clone(),
+                        cancel.clone(),
+                    );
+                    self.snapshot_fetcher = Some((cancel, handle, tx.clone()));
+                    Some(tx)
+                }
+            }
         } else {
-            None
+            self.snapshot_fetcher.as_ref().map(|(_, _, tx)| tx.clone())
         };
 
         // delegate to pool
@@ -355,15 +443,80 @@ impl<S: EventSink, R: RawFrameSink> VenueAdapter<S> for BinanceAdapter<S, R> {
                 &self.raw,
                 &self.venue_id,
                 &mut self.next_id,
-                funding,
+                funding.clone(),
                 snapshot_tx,
             )
-            .await
+            .await?;
+
+        // Phase-2 REST pollers (A6 + dead-markPrice replacement), spawned
+        // only once the WS leg is up so a failed subscribe leaves nothing
+        // running (the N8 retry path still calls disconnect to roll back).
+        // `running` guards incremental subscribe calls against duplicates.
+        let client = pollers::poller_client();
+        if want_premium && !self.running.premium {
+            self.running.premium = true;
+            self.sources.spawn(Box::new(pollers::PremiumIndexPoller {
+                sink: self.sink.clone(),
+                raw: self.raw.clone(),
+                venue_id: self.venue_id.clone(),
+                funding: funding.clone(),
+                every: self.poller_cfg.premium_index,
+                client: client.clone(),
+            }));
+        }
+        if want_realized && !self.running.realized {
+            self.running.realized = true;
+            self.sources.spawn(Box::new(pollers::FundingRealizedPoller {
+                sink: self.sink.clone(),
+                raw: self.raw.clone(),
+                venue_id: self.venue_id.clone(),
+                funding,
+                every: self.poller_cfg.funding_realized,
+                client: client.clone(),
+            }));
+        }
+        if (want_oi_all || !oi_static.is_empty()) && !self.running.open_interest {
+            self.running.open_interest = true;
+            let universe = if want_oi_all {
+                match &self.universe {
+                    Some(rx) => pollers::UniverseSource::Dynamic(rx.clone()),
+                    None => {
+                        // No live feed yet: sweep a snapshot of TRADING
+                        // perps. A subscribe failure here must fail loudly —
+                        // an empty OI universe is silent zero-data.
+                        let instruments = self.fetch_instruments().await?;
+                        let perps: Vec<std::sync::Arc<str>> = instruments
+                            .iter()
+                            .filter(|i| matches!(i.class, InstrumentClass::Perp))
+                            .map(|i| i.id.value.clone())
+                            .collect();
+                        tracing::info!(
+                            perps = perps.len(),
+                            "OI universe: static snapshot (no universe feed attached)"
+                        );
+                        pollers::UniverseSource::Static(std::sync::Arc::new(perps))
+                    }
+                }
+            } else {
+                pollers::UniverseSource::Static(std::sync::Arc::new(oi_static))
+            };
+            self.sources.spawn(Box::new(pollers::OpenInterestPoller {
+                sink: self.sink.clone(),
+                raw: self.raw.clone(),
+                venue_id: self.venue_id.clone(),
+                universe,
+                every: self.poller_cfg.open_interest,
+                client,
+            }));
+        }
+        Ok(())
     }
 
     async fn disconnect(&mut self) -> Result<(), VenueError> {
         self.pool.disconnect().await?;
-        if let Some((cancel, handle)) = self.snapshot_fetcher.take() {
+        self.sources.shutdown().await;
+        self.running = RunningPollers::default();
+        if let Some((cancel, handle, _tx)) = self.snapshot_fetcher.take() {
             cancel.cancel();
             let _ = handle.await;
         }

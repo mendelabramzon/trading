@@ -13,6 +13,7 @@ pub mod parquet_converter;
 pub mod qa;
 pub mod stats;
 pub mod sweep;
+pub mod tables;
 
 pub use qa::{qa_wal, QaReport, QaStatus};
 pub use stats::{CaptureStats, EventKind, StatsSink, WriterStats};

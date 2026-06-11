@@ -1,0 +1,12 @@
+[Unit]
+Description=Daily funding reconciliation at 02:30 UTC
+
+[Timer]
+# 02:30 UTC: yesterday's last hourly sweep (~00:00–01:00) has long published,
+# and the 2h poller catch-up window for late settlements has closed.
+OnCalendar=*-*-* 02:30:00 UTC
+Persistent=true
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target

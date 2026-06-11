@@ -1,0 +1,9 @@
+# Bybit linear perpetual fee schedule (public non-VIP tier). Fractions, not
+# percent: 0.00055 = 5.5 bps taker. valid_from marks when the schedule
+# applied; append rows on change, never rewrite history.
+[[schedule]]
+valid_from = "2026-01-01"
+tier = "vip0"
+market = "linear_perp"
+maker = "0.0002"
+taker = "0.00055"

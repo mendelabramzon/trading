@@ -1,9 +1,11 @@
 # Architecture: Trading Data Framework
 
-*Updated 2026-06-11 after Phase 1 (unattended capture: config, venue-process,
-heartbeat, startup retry, hourly conversion + daily QA, systemd). Sections
-marked **[planned]** describe components that do not exist yet; everything else
-is implemented and tested.*
+*Updated 2026-06-11 after Phase 2 (completeness and reference: REST pollers
+for funding/mark/index/OI, `backfill` + daily reconciliation, universe
+manager, `symbology` — canonical mapping, instruments SCD, fees; the consumer
+contract lives in `docs/data-products.md`). Sections marked **[planned]**
+describe components that do not exist yet; everything else is implemented
+and tested.*
 
 ## 1. System Overview
 
@@ -20,8 +22,10 @@ contradiction: there is no recorder process behind the bus at all.
  │ config.toml → venue-binance                  │            ┌───────────────┐
  │  WsPool (N conns, acks, stale watchdog) ──┐  │            │ event bus     │
  │  REST snapshot fetcher (paced) ───────────┤  │   lossy    │ (UDS, lossy,  │
- │  fundingInfo / exchangeInfo fetch ────────┤  │ ──────────>│  gap-counted) │
- │                                           ▼  │            └──────┬────────┘
+ │  REST pollers: premiumIndex/OI/funding ───┤  │ ──────────>│  gap-counted) │
+ │  universe manager (15 min diff → Ref ev) ─┤  │            └──────┬────────┘
+ │  fundingInfo / exchangeInfo fetch ────────┤  │                   │
+ │                                           ▼  │                   │
  │            normalize → Event ─ StatsSink ─┬──│── data/wal/  (lossless)
  │            raw frames ──── RawWalSink ────┴──│── data/raw/  (best-effort tee)
  │  heartbeat (1/min) ── journald               │                   │
@@ -41,19 +45,21 @@ shipping WAL/Parquet files to other machines, never stretching the bus.
 | Crate            | Purpose                                                                      |
 |------------------|------------------------------------------------------------------------------|
 | `venue-core`     | Envelope v2 (`Event`), domain payloads (`Market/Reference/Chain/Account/Control`), symbology types (`Asset`, `InstrumentClass`, `CanonicalInstrumentId`, `LifecycleState`), `SourceId`, `Provenance`, `RawFrame` |
-| `venue-adapter`  | Traits (RPITIT, no async_trait): `EventSink` (+`send_batch`), `RawFrameSink`, `VenueAdapter<S>`, `Subscription{scope, data}`, `Scope`, `DataType`, `VenueError` |
-| `venue-binance`  | USD-M futures adapter: WsPool (sharding, ack watcher, stale watchdog, jittered backoff, control events, raw tee), REST depth-snapshot fetcher, fundingInfo/exchangeInfo fetch, parser fixture tests |
+| `venue-adapter`  | Traits (RPITIT, no async_trait): `EventSink` (+`send_batch`), `RawFrameSink`, `VenueAdapter<S>`, `Subscription{scope, data}`, `Scope`, `DataType`, `VenueError`; `IngestSource` + `SourceSet` (R11 — the unit of ingestion composition, dyn-compatible) |
+| `venue-binance`  | USD-M futures adapter: WsPool (sharding, ack watcher, stale watchdog, jittered backoff, control events, raw tee), REST depth-snapshot fetcher, **Phase-2 REST pollers** (premiumIndex / openInterest / fundingRate — the producers for mark/index/funding/OI since the markPrice WS family is acked-but-dead), fundingInfo/exchangeInfo fetch, parser fixture tests |
 | `wire`           | Framed MessagePack: `[magic "WAL1"][version u8][len u32][crc32][payload]`; self-healing `FrameReader`; golden-bytes + encoding-probe tests pin the layout |
-| `recorder`       | `WalWriter`/`WalSink` (lossless, dedicated thread, 1 s fsync, midnight rotation, fatal-exit on I/O error), `RawWalWriter` (R2 tee), `stats` (P5d counters: `StatsSink`, `WriterStats`), Parquet converter (zstd, nullable columns, UTC-ns timestamps, 500K-row batches), `qa` (daily QA report), `sweep` + `wal-sweep` bin (P6 conversion automation) |
-| `config`         | TOML capture config: strict parsing (`deny_unknown_fields`), validation that rejects data types the venue cannot deliver (silent zero-data → startup error), config→`Subscription` mapping |
-| `venue-process`  | Supervised capture binary: config → writers → adapter; startup retry with rollback (N8), once-a-minute heartbeat (P5d), daily exchangeInfo dump (P5a), SIGTERM/SIGINT graceful shutdown; exit codes 0/1/2 |
+| `recorder`       | `WalWriter`/`WalSink` (lossless, dedicated thread, 1 s fsync, midnight rotation, fatal-exit on I/O error), `RawWalWriter` (R2 tee), `stats` (P5d counters: `StatsSink`, `WriterStats`), `tables` (Parquet table writers shared with `backfill` — schema-identical live and backfilled data), Parquet converter (zstd, nullable columns, UTC-ns timestamps, 500K-row batches, incl. `reference.parquet`), `qa` (daily QA report), `sweep` + `wal-sweep` bin (P6 conversion automation) |
+| `config`         | TOML capture config: strict parsing (`deny_unknown_fields`), validation that rejects data types the venue cannot deliver (silent zero-data → startup error), `[pollers]` cadences, `[universe]` policy, config→`Subscription` mapping |
+| `venue-process`  | Supervised capture binary: config → writers → adapter; startup retry with rollback (N8), once-a-minute heartbeat (P5d), daily exchangeInfo + fundingInfo dumps (P5a), universe manager (A11/R4: 15-min full-symbol diff → `Reference` events, OI-universe watch feed, optional auto-subscribe), SIGTERM/SIGINT graceful shutdown; exit codes 0/1/2 |
+| `backfill`       | REST history (A5): `funding` (Binance venue-wide + Bybit per-symbol), `oi-hist` (perishable ~30-day window), `klines`, and `reconcile` (daily captured-vs-REST funding coverage with `consecutive_green_days`); month/day-partitioned Parquet under `data/backfill/`, atomic publish, idempotent |
+| `symbology`      | Reference-data builds (A3/A11): canonical mapping + point-in-time `Registry`, instruments SCD from accumulated dumps, fee schedules from curated TOML; one `symbology build` bin for the daily timer |
 
 ### Planned (per `report-fable-10062026.md` §6.3)
 
-`backfill` (Phase 2: REST pollers — funding/mark/index `premiumIndex`, OI,
-reconciliation), `symbology` registry build (Phase 2), `bus`/`transport`
-(Phase 3, or `iceoryx2`), `replay` (Phase 4), `strategy` (Phase 4), `execution`
-(Phase 6), manifest/lake (Phase 3).
+`bus`/`transport` (Phase 3, or `iceoryx2`), manifest/lake re-layout (Phase 3),
+`replay` (Phase 4), `strategy` (Phase 4), `execution` (Phase 6). Research
+notebooks and strategy code live in separate repositories; this repo's
+consumer surface is documented in `docs/data-products.md`.
 
 ### Dependency graph (actual)
 
@@ -64,6 +70,8 @@ venue-binance  ─►  venue-adapter, venue-core    (dev-dep: recorder, for exam
 recorder       ─►  venue-adapter, venue-core, wire
 config         ─►  venue-adapter, venue-core
 venue-process  ─►  config, recorder, venue-binance, venue-adapter, venue-core
+backfill       ─►  recorder (tables), venue-core, wire
+symbology      ─►  recorder (tables), venue-core
 ```
 
 `venue-adapter` deliberately does **not** depend on `wire`: adapters are
@@ -227,9 +235,61 @@ One `read_loop` serves initial and reconnected sessions:
   JSON body; `venue-process` writes it to
   `data/meta/binance/<date>-exchangeInfo.json` at startup and on every UTC
   date change (with a 30 s timeout and retry-next-minute on failure), so
-  reference fields the parser drops remain recoverable. `fetch_instruments`
-  parses tick/lot/notional filters, margin asset, delivery dates, lifecycle
-  status and funding intervals into the extended `Instrument`.
+  reference fields the parser drops remain recoverable. A sibling daily
+  `<date>-fundingInfo.json` dump preserves interval/clamp *history* for the
+  SCD. `fetch_instruments` parses tick/lot/notional filters, margin asset,
+  delivery dates, lifecycle status and funding intervals into the extended
+  `Instrument`; `fetch_instruments_all` skips the TRADING filter (the
+  universe manager's input).
+
+### IngestSource and the Phase-2 REST pollers (R11 + A6)
+
+A venue process hosts N `IngestSource`s sharing one sink and one WAL. The
+trait is dyn-compatible (`label()`, `source_id()`,
+`run(Box<Self>, CancellationToken)`); `SourceSet` supervises spawned sources
+(cancel → 3 s grace → abort, reusable across the N8 retry rollback). The
+WsPool and snapshot fetcher predate the trait and match its contract
+internally; the pollers implement it natively.
+
+Three pollers, all `SourceId::REST`, told apart in the control timeline by
+label and in heartbeats by event kind (REST sources share id 0 by the frozen
+wire-v1 convention, so per-kind staleness *is* the per-poller detector):
+
+- **premium-index** (`/fapi/v1/premiumIndex`, no symbol → all ~800 symbols,
+  weight 10, default 30 s): emits `MarkPrice` + `IndexPrice` +
+  `FundingRatePrediction` per row — the replacement for the acked-but-dead
+  markPrice WS family, whose streams stay subscribed only as a free fallback
+  (a revived WS producer would be distinguishable by `source >= 1`). Rows
+  with `nextFundingTime = 0` (settling symbols, delivery futures) emit no
+  prediction. Intervals/clamps stamped from fundingInfo, refreshed daily.
+- **open-interest** (`/fapi/v1/openInterest`, weight 1, per-symbol): paced
+  round-robin over the TRADING-perp universe, one sweep per interval
+  (default 300 s, matching the venue's own 5 m OI-history grain). The
+  universe arrives over a `watch` channel fed by the universe manager;
+  HTTP 400 on settling symbols is routine and skipped.
+- **realized-funding** (`/fapi/v1/fundingRate` venue-wide tail poll,
+  default 300 s): 1 h lookback per cycle, 2 h catch-up after restart, dedup
+  by `(symbol, fundingTime)`, saturation paging that advances to the last
+  settlement instant *inclusive* (a `last + 1` advance can skip rows when an
+  instant straddles a page boundary). This poller is the funding-coverage
+  SLO source.
+
+Poller health follows A7: first success / recovery emits `ConnUp{label}`,
+the third consecutive failed cycle emits `ConnDown{label, reason}`. REST
+response bodies are teed raw before parsing — R2 applies to REST exactly as
+to WS (`interestRate`, `estimatedSettlePrice` are not parsed but stay
+recoverable from `data/raw/`).
+
+### Universe manager (A11/R4)
+
+Every `universe.poll_secs` (default 15 min) the venue process fetches *all*
+symbols, diffs the normalized `Instrument`s against persisted state
+(`data/meta/<venue>/universe.json` — restart emits no duplicate burst; a
+missing file produces the one-time baseline burst by design), records
+transitions as `ReferencePayload` events through the normal sink (→
+`reference.parquet`), updates the OI poller's watch channel, and optionally
+auto-subscribes newly TRADING perps per `[universe] auto_subscribe_data`
+(default off; baseline bursts never auto-subscribe).
 
 ## 5. Recording Layer
 
@@ -361,6 +421,38 @@ reconnect" — reconnect losses are visible but expected (A7); the same break
 on a healthy connection fails the day. Report-only in v1: trade/ticker id
 regressions, gap counts, latencies, snapshots pending at EOF (their splice
 lands in the next file).
+
+### Backfill and reconciliation (Phase 2, A5)
+
+REST history is *derived, refetchable* data and bypasses the WAL: the
+`backfill` bin writes Parquet directly to `data/backfill/<venue>/<dataset>/`,
+month-partitioned (`oi_hist` day-partitioned), atomically published — the
+final file is the completion marker, the wal-sweep idiom; the open period is
+a `.partial` refreshed per run. Schemas are identical to the live tables via
+the shared `recorder::tables` writers, so consumers union live + history and
+dedup on `(instrument, funding_time)`. Datasets, venues, caveats:
+`docs/data-products.md`.
+
+The daily **reconciler** (`backfill reconcile`, 02:30 UTC timer) compares
+yesterday's captured `FundingRateRealized` events (published parquet of D,
+D+1's spillover parquet/WAL — a 23:59 settlement is discovered after
+midnight) against an independent REST refetch, writing
+`data/meta/reconciliation/<venue>/<date>.json` with `coverage_pct`,
+`missing/extra/rate_mismatches`, and `consecutive_green_days`. **The Phase-2
+exit criterion is the latest report reaching `consecutive_green_days >= 14`.**
+Honest caveat: live realized funding is itself REST-polled (dead WS family),
+so this verifies pipeline completeness end-to-end — poller uptime → WAL →
+conversion → publish — not dual-channel agreement; `rate_mismatches` becomes
+load-bearing if a WS source revives.
+
+### Reference data builds (Phase 2, A3/A11)
+
+`symbology build` (daily 04:00 UTC timer) deterministically rebuilds, from
+the day's raw dumps and curated configs, three queryable datasets under
+`data/meta/`: the canonical mapping (+ point-in-time `Registry` for later
+phases), the instruments SCD, and fee schedules. Curated inputs live in
+`configs/symbology-overrides.toml` and `configs/fees/`. Dumps stay truth;
+every product is a full rebuild, atomically published.
 
 ### Runbook
 

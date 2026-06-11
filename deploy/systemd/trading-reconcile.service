@@ -1,0 +1,16 @@
+# Daily funding reconciliation (A5): yesterday's captured FundingRateRealized
+# events vs an independent REST refetch. Report (incl. consecutive_green_days
+# — the Phase-2 exit reads >= 14 off the latest one) lands in
+# data/meta/reconciliation/<venue>/<date>.json.
+# Driven by trading-reconcile.timer; idempotent (existing report honored;
+# --force to re-evaluate).
+[Unit]
+Description=Daily funding coverage reconciliation (WAL/parquet vs REST)
+
+[Service]
+Type=oneshot
+User=trading
+WorkingDirectory=/var/lib/trading
+ExecStart=/opt/trading/bin/backfill reconcile --venue binance --data-dir data
+# Exit 1 on fail/blocked leaves the unit failed — visible in
+# `systemctl list-units --failed` and journald.

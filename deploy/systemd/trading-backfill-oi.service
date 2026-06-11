@@ -1,0 +1,13 @@
+# Daily OI-history backfill — perishable data: /futures/data/openInterestHist
+# retains only ~30 days (5 m grain), so this runs daily until the live OI
+# poller has accumulated >= 30 days of coverage, then the timer can be
+# disabled (retirement criterion; see deploy/README.md).
+# Idempotent: published day files are skipped; today refreshes as .partial.
+[Unit]
+Description=Daily open-interest history backfill (~30-day venue retention)
+
+[Service]
+Type=oneshot
+User=trading
+WorkingDirectory=/var/lib/trading
+ExecStart=/opt/trading/bin/backfill oi-hist --venue binance --data-dir data

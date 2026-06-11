@@ -205,14 +205,19 @@ struct FundingInfoEntry {
     funding_interval_hours: Option<u64>,
 }
 
-pub(crate) async fn fetch_funding_info() -> Result<FundingMap, VenueError> {
+/// fundingInfo plus its raw body (the P5a pattern): the venue process dumps
+/// the JSON to `data/meta/` daily so interval/clamp *history* feeds the
+/// instruments SCD — the parsed map only ever holds "now".
+pub(crate) async fn fetch_funding_info_raw() -> Result<(String, FundingMap), VenueError> {
     let url = format!("{BASE_REST_URL}/fapi/v1/fundingInfo");
-    let entries: Vec<FundingInfoEntry> = reqwest::get(&url)
+    let text = reqwest::get(&url)
         .await
         .map_err(|e| VenueError::RequestFailed(e.to_string()))?
-        .json()
+        .text()
         .await
         .map_err(|e| VenueError::RequestFailed(e.to_string()))?;
+    let entries: Vec<FundingInfoEntry> = serde_json::from_str(&text)
+        .map_err(|e| VenueError::RequestFailed(format!("fundingInfo parse: {e}")))?;
 
     let map = entries
         .into_iter()
@@ -229,5 +234,9 @@ pub(crate) async fn fetch_funding_info() -> Result<FundingMap, VenueError> {
         })
         .collect();
 
-    Ok(Arc::new(map))
+    Ok((text, Arc::new(map)))
+}
+
+pub(crate) async fn fetch_funding_info() -> Result<FundingMap, VenueError> {
+    fetch_funding_info_raw().await.map(|(_, map)| map)
 }
