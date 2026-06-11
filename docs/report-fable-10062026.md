@@ -564,6 +564,11 @@ for the traded subset.
 Phases are sequential gates, each with an exit criterion. Phase 0 amends the
 accepted `improvement_plan.md` rather than replacing it.
 
+*As-built exit notes are appended at phase boundaries (blockquotes below).
+The roadmap was revised 2026-06-11 — re-scoped to the capture-repo boundary —
+and the living plan is now `docs/implementation-plan.md`; this section stays
+as the original rationale.*
+
 **Phase 0 — one schema re-cut (improvement_plan + riders).** Land steps 1–10 as
 designed, plus, in the same wire-v1 freeze: domain namespacing (R1), funding
 `interval`+clamps (A4), `OpenInterest`/`Liquidation` (A6), `Payload::Control`
@@ -589,12 +594,34 @@ heartbeat (P5d), WAL fatality policy (N2), startup retry (N8), systemd
 supervision, CI (R12). *Exit: Binance capturing 7×24 with zero manual steps and a
 daily QA report.*
 
+> **✅ Build complete 2026-06-11; mechanisms demonstrated locally.**
+> Config-driven `venue-process`, heartbeat, WAL-fatality drill, raw tee
+> default-on, hourly-sweep + QA automation, systemd units + runbook
+> (`deploy/README.md`), CI green (fmt/clippy/test). First full unattended
+> day (2026-06-10, dev host): rotation → sweep → QA `pass`, 346,948 events,
+> 0 corrupt frames. The formal 7×24-under-systemd demonstration rides along
+> with the Phase-2 green-day window on the deploy host (see
+> `implementation-plan.md`).
+
 **Phase 2 — completeness and reference.** `backfill` crate + daily WS-vs-REST
 reconciliation (A5), OI/liquidation pollers (A6), instruments SCD + universe
 manager (A11/R4), fee schedules. **Strategy research starts here** on REST history
 — months of funding/OI data are available immediately. *Exit: funding coverage
 100% vs REST for 14 consecutive days; research notebook answers cross-venue
 funding-spread queries.*
+
+> **🔶 Build complete 2026-06-11; exit accumulating.** All deliverables
+> landed: REST pollers (premiumIndex/OI/fundingRate — replacing the
+> acked-but-dead markPrice WS family), `backfill` (Binance **and Bybit**
+> funding history — an early Phase-5 pre-validation — plus perishable OI
+> history and klines), daily reconciler with `consecutive_green_days`,
+> universe manager, instruments SCD, fee schedules, canonical mapping +
+> point-in-time `Registry`; `symbology/examples/spread_check.rs` answers the
+> cross-venue funding-spread query in-repo (notebooks live in the research
+> repo). The SLO clock starts with the first fully-poller-covered day
+> (2026-06-12), so the earliest exit is ~2026-06-26. Caveat recorded in
+> `data-products.md`: live realized funding is itself REST-polled, so
+> reconciliation verifies pipeline completeness, not dual-channel agreement.
 
 **Phase 3 — research surface + distribution.** Hive lake, zstd, sorted row groups,
 manifest + QA gates (R10, A14); then the lossy bus (or `iceoryx2`) with handshake

@@ -1,11 +1,12 @@
 # Architecture: Trading Data Framework
 
-*Updated 2026-06-11 after Phase 2 (completeness and reference: REST pollers
-for funding/mark/index/OI, `backfill` + daily reconciliation, universe
-manager, `symbology` — canonical mapping, instruments SCD, fees; the consumer
-contract lives in `docs/data-products.md`). Sections marked **[planned]**
-describe components that do not exist yet; everything else is implemented
-and tested.*
+*Updated 2026-06-11 after the Phase-2 build (completeness and reference:
+REST pollers for funding/mark/index/OI, `backfill` + daily reconciliation,
+universe manager, `symbology` — canonical mapping, instruments SCD, fees).
+The Phase-2 exit SLO is accumulating; `docs/implementation-plan.md` is the
+living plan and `docs/data-products.md` the consumer contract. Sections
+marked **[planned]** describe components that do not exist yet; everything
+else is implemented and tested.*
 
 ## 1. System Overview
 
@@ -54,12 +55,14 @@ shipping WAL/Parquet files to other machines, never stretching the bus.
 | `backfill`       | REST history (A5): `funding` (Binance venue-wide + Bybit per-symbol), `oi-hist` (perishable ~30-day window), `klines`, and `reconcile` (daily captured-vs-REST funding coverage with `consecutive_green_days`); month/day-partitioned Parquet under `data/backfill/`, atomic publish, idempotent |
 | `symbology`      | Reference-data builds (A3/A11): canonical mapping + point-in-time `Registry`, instruments SCD from accumulated dumps, fee schedules from curated TOML; one `symbology build` bin for the daily timer |
 
-### Planned (per `report-fable-10062026.md` §6.3)
+### Planned (see `docs/implementation-plan.md`)
 
-`bus`/`transport` (Phase 3, or `iceoryx2`), manifest/lake re-layout (Phase 3),
-`replay` (Phase 4), `strategy` (Phase 4), `execution` (Phase 6). Research
-notebooks and strategy code live in separate repositories; this repo's
-consumer surface is documented in `docs/data-products.md`.
+Manifest + metrics/alerting (Phase 3), `replay` (Phase 4), `bus`/`transport`
+(demand-gated: built — or `iceoryx2` adopted — when the first live consumer
+exists). The strategy runtime and execution engines live in **separate
+repositories** by design; they consume this repo's datasets
+(`docs/data-products.md`) and, later, its replay crate. The capture-side
+seam for private account data (`data/private/`, Phase 6) stays here.
 
 ### Dependency graph (actual)
 
@@ -478,13 +481,15 @@ Contracts already settled, recorded here so the implementation cannot drift:
 - Inputs come from the manifest with QA status (R10, Phase 3); replaying
   unaudited data at minimum warns loudly.
 
-## 8. Event Bus **[planned — Phase 3]**
+## 8. Event Bus **[planned — demand-gated]**
 
-Lossy-only, gap-counted, restart-tolerant; spec'd in one page before building
-(A10), or `iceoryx2` adopted instead. With the WAL at the edge the bus has no
-durability requirement — never build lossless consumer backpressure. Slow
-consumers get drops plus `Control::Gap{reason, dropped}` injections. Private
-`Account` events never transit the shared bus (A13).
+Built (or `iceoryx2` adopted) only when the first live consumer exists —
+expected to be a paper-trading strategy process in its own repo
+(`implementation-plan.md`, DEC-3). Lossy-only, gap-counted, restart-tolerant;
+spec'd in one page before building (A10). With the WAL at the edge the bus
+has no durability requirement — never build lossless consumer backpressure.
+Slow consumers get drops plus `Control::Gap{reason, dropped}` injections.
+Private `Account` events never transit the shared bus (A13).
 
 ## 9. Scalability and Performance
 
@@ -501,6 +506,10 @@ are the KPIs, not microseconds.
 | Parquet vs WAL size             | zstd, typically 5–10× smaller |
 
 Venue scaling: new crate + new process; nothing else changes. Instrument
-scaling: WsPool shards at 200 streams/conn. Storage scaling: tiering (full
-depth only for the traded subset) and the Hive/manifest lake layout land in
-Phase 3 (A14/R10).
+scaling: WsPool shards at 200 streams/conn. Storage scaling: tiering is
+config reality today (full depth for the traded subset only; venue-wide
+funding/mark/index/OI — A14); the queryable manifest lands in Phase 3 (R10).
+The report's Hive lake re-layout was **dropped**: `data/parquet/<venue>/<date>/`
+is the published consumer contract and DuckDB reads it directly — the
+manifest, not a path convention, becomes the catalog
+(`docs/implementation-plan.md`, decision DEC-2).

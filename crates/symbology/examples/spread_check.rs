@@ -32,8 +32,7 @@ fn read_funding(dir: &Path) -> Vec<FundingRow> {
         .flatten()
         .map(|e| e.path())
         .filter(|p| {
-            p.extension().is_some_and(|e| e == "parquet")
-                && !p.to_string_lossy().contains(".tmp-")
+            p.extension().is_some_and(|e| e == "parquet") && !p.to_string_lossy().contains(".tmp-")
         })
         .collect();
     files.sort();
@@ -80,10 +79,7 @@ fn read_funding(dir: &Path) -> Vec<FundingRow> {
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let data_dir = PathBuf::from(args.first().map(String::as_str).unwrap_or("data"));
-    let days: u64 = args
-        .get(1)
-        .and_then(|d| d.parse().ok())
-        .unwrap_or(90);
+    let days: u64 = args.get(1).and_then(|d| d.parse().ok()).unwrap_or(90);
 
     let registry = match Registry::load(&data_dir.join("meta/symbology/mapping.parquet")) {
         Ok(r) => r,
@@ -111,7 +107,10 @@ fn main() -> ExitCode {
         };
         let rows = read_funding(&data_dir.join("backfill").join(venue).join("funding"));
         if rows.is_empty() {
-            eprintln!("no backfilled funding for {venue} under {}", data_dir.display());
+            eprintln!(
+                "no backfilled funding for {venue} under {}",
+                data_dir.display()
+            );
             return ExitCode::from(1);
         }
         for row in rows {
@@ -152,7 +151,11 @@ fn main() -> ExitCode {
         })
         .collect();
     let matched = spreads.len();
-    spreads.sort_by(|a, b| b.3.abs().partial_cmp(&a.3.abs()).unwrap_or(std::cmp::Ordering::Equal));
+    spreads.sort_by(|a, b| {
+        b.3.abs()
+            .partial_cmp(&a.3.abs())
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
 
     println!(
         "window: last {days} days | rows used: binance={} bybit={} | canonical perps with data on both venues: {matched}",

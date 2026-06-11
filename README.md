@@ -4,18 +4,20 @@ Event-driven market data infrastructure for collecting, recording, and replaying
 data from multiple venues. Built for strategy development and live trading.
 
 **Status (2026-06-11):** single-venue capture is real, hardened, and
-**unattended** (Phase 1), and the completeness/reference layer is in
-(Phase 2) — Binance USD-M futures → framed WAL (+ raw-frame tee) → zstd
-Parquet with a daily QA report, run from a TOML config under systemd; REST
-pollers capture funding/mark/index/OI (the venue's markPrice WS family is
-dead); `backfill` holds multi-year funding history for **Binance and Bybit**
-plus the perishable 30-day OI history; a daily reconciler tracks the
-funding-coverage SLO (`consecutive_green_days`); `symbology` builds the
-canonical cross-venue mapping, instruments SCD, and fee schedules. The
+**unattended** (Phase 1), and the Phase-2 completeness/reference layer
+is built and operating — Binance USD-M futures → framed WAL (+ raw-frame
+tee) → zstd Parquet with a daily QA report, run from a TOML config under
+systemd; REST pollers capture funding/mark/index/OI (the venue's markPrice
+WS family is dead); `backfill` holds multi-year funding history for
+**Binance and Bybit** plus the perishable 30-day OI history; `symbology`
+builds the canonical cross-venue mapping, instruments SCD, and fee
+schedules. Phase 2 *exits* when the daily reconciler reaches
+`consecutive_green_days >= 14` (accumulating; earliest ~2026-06-26). The
 consumer contract for all datasets is `docs/data-products.md` — research
-notebooks and strategy code live in separate repositories. The event bus,
-replay, and strategy layers are designed but **not built yet**; diagrams
-below mark them *(planned)*.
+notebooks, strategies, and execution live in **separate repositories**.
+The event bus and replay layers are designed but **not built yet**
+(`docs/implementation-plan.md` is the living plan); diagrams below mark
+them *(planned)*.
 
 ## Architecture
 
@@ -126,7 +128,7 @@ events through the same sink.
 | `venue-process` | built | Unattended supervised capture entrypoint: startup retry, heartbeat, daily exchangeInfo + fundingInfo dumps, universe manager (lifecycle → `Reference` events, auto-subscribe), graceful shutdown |
 | `backfill` | built | REST history (Binance + Bybit funding, OI history, klines) + daily funding reconciler with the 14-day coverage criterion |
 | `symbology` | built | Canonical mapping + point-in-time `Registry`, instruments SCD, fee schedules; `symbology build` bin |
-| `bus` / `replay` / `strategy` / `execution` | planned (Phases 3–6) | See `docs/report-fable-10062026.md` §7 roadmap |
+| `bus` / `replay` | planned | Live lossy fan-out (demand-gated) and recorded-data replay — see `docs/implementation-plan.md`. Strategy and execution layers live in separate repositories by design; this repo keeps the capture-side seam (private WAL machinery, Phase 6) |
 
 ## Quick start
 
@@ -162,5 +164,7 @@ whether a fapi stream name actually emits (Binance ACKs dead stream names).
 ## See Also
 
 - [docs/architecture.md](docs/architecture.md) — contracts: schema freeze rules, timestamp semantics, reader recovery, converter schemas
-- [docs/report-fable-10062026.md](docs/report-fable-10062026.md) — target architecture and phased roadmap (R1–R12)
+- [docs/data-products.md](docs/data-products.md) — the consumer contract: dataset paths, schemas, join keys, caveats
+- [docs/implementation-plan.md](docs/implementation-plan.md) — the living plan: current phase status and the re-scoped remaining phases
+- [docs/report-fable-10062026.md](docs/report-fable-10062026.md) — target architecture and findings (R1–R12); its §7 roadmap carries as-built exit notes
 - [docs/archive/improvement_plan.md](docs/archive/improvement_plan.md) — the implemented Phase-0 remediation, with as-built amendments (archived)
