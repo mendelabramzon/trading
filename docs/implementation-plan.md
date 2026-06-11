@@ -1,11 +1,11 @@
 # Implementation Plan — revised 2026-06-11
 
-*Successor to the §7 roadmap of `report-fable-10062026.md` (which stays the
-architectural rationale; findings are cited by ID — R*, A*, N*, P*, D*).
-This file is the living plan: phase status, the decisions taken since the
-report, and the re-scoped remaining phases. Convention: phases are
-sequential gates with exit criteria; as-built notes are appended, never
-rewritten over.*
+*The living plan and the **only** phase-status surface — other docs link
+here instead of restating status. Findings cited by ID (R*, A*, N*, P*,
+D*) come from the review documents that preceded this plan, deleted
+2026-06-12 and recoverable from git history (`docs/` before that date).
+Convention: phases are sequential gates with exit criteria; as-built notes
+are appended, never rewritten over.*
 
 ## Phase status
 
@@ -27,8 +27,9 @@ rewritten over.*
   repositories** and consume this repo's datasets (`docs/data-products.md`)
   and, later, its `replay` crate. Consequence: the report's Phase 4 shrinks
   here to replay; Phase 6 shrinks to the private-data capture seam. The
-  contracts in report §6.4 (Ctx, RiskGate, OMS) remain the spec the other
-  repos build against.
+  contracts in report §6.4 (Ctx, RiskGate, OMS —
+  `report-fable-10062026.md`, git history) remain the spec the other repos
+  build against.
 - **DEC-2 — keep the published Parquet layout; drop the Hive re-layout.**
   `data/parquet/<venue>/<date>/<type>.parquet` is the consumer contract and
   DuckDB reads it directly; re-cutting paths now would break consumers for

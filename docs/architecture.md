@@ -1,12 +1,12 @@
 # Architecture: Trading Data Framework
 
-*Updated 2026-06-11 after the Phase-2 build (completeness and reference:
-REST pollers for funding/mark/index/OI, `backfill` + daily reconciliation,
-universe manager, `symbology` — canonical mapping, instruments SCD, fees).
-The Phase-2 exit SLO is accumulating; `docs/implementation-plan.md` is the
-living plan and `docs/data-products.md` the consumer contract. Sections
-marked **[planned]** describe components that do not exist yet; everything
-else is implemented and tested.*
+*System design and contracts. Sections marked **[planned]** describe
+components that do not exist yet; everything else is implemented and
+tested. Phase status lives in `docs/implementation-plan.md` — the single
+status surface; `docs/data-products.md` is the consumer contract. Finding
+tags like (A2), (R2), (N2), (D3) name decisions from the review documents
+this design absorbed; the reviews live in git history (`docs/` before
+2026-06-12) and the tags are kept as stable decision names.*
 
 ## 1. System Overview
 
@@ -345,7 +345,7 @@ control:      instrument?, venue_ts?, local_ts, source, kind, detail(JSON)
 `Reference`/`Chain`/`Account` payloads are counted and logged, not yet
 converted. Conversion refuses files where >1% of bytes were corrupt (P1).
 
-## 6. Operations (Phase 1)
+## 6. Operations
 
 ### Running capture
 
@@ -441,8 +441,8 @@ yesterday's captured `FundingRateRealized` events (published parquet of D,
 D+1's spillover parquet/WAL — a 23:59 settlement is discovered after
 midnight) against an independent REST refetch, writing
 `data/meta/reconciliation/<venue>/<date>.json` with `coverage_pct`,
-`missing/extra/rate_mismatches`, and `consecutive_green_days`. **The Phase-2
-exit criterion is the latest report reaching `consecutive_green_days >= 14`.**
+`missing/extra/rate_mismatches`, and `consecutive_green_days` (the Phase-2
+exit criterion keys on this field — `docs/implementation-plan.md`).
 Honest caveat: live realized funding is itself REST-polled (dead WS family),
 so this verifies pipeline completeness end-to-end — poller uptime → WAL →
 conversion → publish — not dual-channel agreement; `rate_mismatches` becomes

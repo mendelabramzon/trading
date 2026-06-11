@@ -1,6 +1,6 @@
 # Deploy (single Linux host, systemd)
 
-Phase-2 topology: one supervised capture process per venue writing WAL + raw
+Topology: one supervised capture process per venue writing WAL + raw
 tee (WS streams + REST pollers for funding/mark/index/OI); an hourly timer
 converts closed days to Parquet with a daily QA report; daily timers run the
 funding reconciler, the perishable OI-history backfill, and the
@@ -85,7 +85,8 @@ is legitimately stale up to its interval + poll cadence (hours for
 8h-interval-only universes); liquidations for hours on quiet markets —
 staleness is information, not an alarm, until Phase-3 metrics add SLOs.
 
-**Phase-2 exit check**: the latest
+**Phase-2 exit check** (criterion defined in
+`docs/implementation-plan.md`): the latest
 `data/meta/reconciliation/binance/<date>.json` must reach
 `"consecutive_green_days" >= 14`. A `blocked` status means the day was never
 converted/QA-passed (fix the sweep first); `fail` lists exactly which

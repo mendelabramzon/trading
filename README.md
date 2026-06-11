@@ -3,21 +3,15 @@
 Event-driven market data infrastructure for collecting, recording, and replaying
 data from multiple venues. Built for strategy development and live trading.
 
-**Status (2026-06-11):** single-venue capture is real, hardened, and
-**unattended** (Phase 1), and the Phase-2 completeness/reference layer
-is built and operating — Binance USD-M futures → framed WAL (+ raw-frame
-tee) → zstd Parquet with a daily QA report, run from a TOML config under
-systemd; REST pollers capture funding/mark/index/OI (the venue's markPrice
-WS family is dead); `backfill` holds multi-year funding history for
-**Binance and Bybit** plus the perishable 30-day OI history; `symbology`
-builds the canonical cross-venue mapping, instruments SCD, and fee
-schedules. Phase 2 *exits* when the daily reconciler reaches
-`consecutive_green_days >= 14` (accumulating; earliest ~2026-06-26). The
-consumer contract for all datasets is `docs/data-products.md` — research
-notebooks, strategies, and execution live in **separate repositories**.
-The event bus and replay layers are designed but **not built yet**
-(`docs/implementation-plan.md` is the living plan); diagrams below mark
-them *(planned)*.
+**What runs today:** Binance USD-M futures capture — WS streams + REST
+pollers → framed WAL (+ raw tee) → zstd Parquet with daily QA — unattended
+under systemd, plus REST history backfills and reference-data builds
+(canonical mapping, instruments SCD, fees). The event bus and replay layers
+are designed, not built; diagrams below mark them *(planned)*. Phase status
+lives in one place: [docs/implementation-plan.md](docs/implementation-plan.md).
+The consumer contract for all datasets is
+[docs/data-products.md](docs/data-products.md) — research, strategies, and
+execution live in **separate repositories**.
 
 ## Architecture
 
@@ -117,18 +111,20 @@ events through the same sink.
 
 ## Crate Map
 
+Full per-crate detail and the dependency graph: `docs/architecture.md` §2.
+
 | Crate | Status | Purpose |
 |-------|--------|---------|
-| `venue-core` | built | Envelope v2, domain payloads, symbology types (`Asset`, `InstrumentClass`, `CanonicalInstrumentId`), `SourceId`, `Provenance`, `RawFrame` |
-| `venue-adapter` | built | Traits (RPITIT): `EventSink` (+`send_batch`), `RawFrameSink`, `VenueAdapter<S>`, `Subscription{scope,data}` |
-| `venue-binance` | built | Binance USD-M adapter: WsPool, REST snapshot fetcher, Phase-2 REST pollers (premiumIndex/OI/fundingRate — the WS markPrice family is dead on fapi), fundingInfo, exchangeInfo dump, fixture tests |
-| `wire` | built | Framed MessagePack (`magic/version/len/crc32`), self-healing `FrameReader`, golden-bytes layout pin |
-| `recorder` | built | `WalWriter`/`WalSink`, `RawWalWriter`, capture stats (heartbeat counters), shared Parquet table writers (`tables`), zstd converter (incl. `reference.parquet`), QA module, `wal-sweep` bin, acceptance checker (`verify_depth`) |
-| `config` | built | Strict TOML capture config; rejects subscriptions the venue can't deliver; `[pollers]` cadences, `[universe]` policy |
-| `venue-process` | built | Unattended supervised capture entrypoint: startup retry, heartbeat, daily exchangeInfo + fundingInfo dumps, universe manager (lifecycle → `Reference` events, auto-subscribe), graceful shutdown |
-| `backfill` | built | REST history (Binance + Bybit funding, OI history, klines) + daily funding reconciler with the 14-day coverage criterion |
-| `symbology` | built | Canonical mapping + point-in-time `Registry`, instruments SCD, fee schedules; `symbology build` bin |
-| `bus` / `replay` | planned | Live lossy fan-out (demand-gated) and recorded-data replay — see `docs/implementation-plan.md`. Strategy and execution layers live in separate repositories by design; this repo keeps the capture-side seam (private WAL machinery, Phase 6) |
+| `venue-core` | built | Envelope v2, domain payloads, symbology types, `SourceId`, `Provenance`, `RawFrame` |
+| `venue-adapter` | built | Traits (RPITIT): `EventSink`, `RawFrameSink`, `VenueAdapter<S>`, `Subscription`; `IngestSource`/`SourceSet` |
+| `venue-binance` | built | Binance USD-M adapter: WsPool, REST snapshot fetcher + pollers, fixture tests |
+| `wire` | built | Framed MessagePack (`magic/version/len/crc32`), self-healing `FrameReader`, golden-bytes pin |
+| `recorder` | built | WAL/raw-tee writers, capture stats, Parquet tables + converter, QA, `wal-sweep` bin |
+| `config` | built | Strict TOML capture config; rejects subscriptions the venue can't deliver |
+| `venue-process` | built | Supervised capture entrypoint: startup retry, heartbeat, daily dumps, universe manager |
+| `backfill` | built | REST history (funding, OI, klines) + the daily funding reconciler |
+| `symbology` | built | Canonical mapping, instruments SCD, fee schedules; `symbology build` bin |
+| `bus` / `replay` | planned | Live lossy fan-out (demand-gated) and recorded-data replay — `docs/implementation-plan.md` |
 
 ## Quick start
 
@@ -163,8 +159,7 @@ whether a fapi stream name actually emits (Binance ACKs dead stream names).
 
 ## See Also
 
-- [docs/architecture.md](docs/architecture.md) — contracts: schema freeze rules, timestamp semantics, reader recovery, converter schemas
+- [docs/architecture.md](docs/architecture.md) — system design and contracts: schema freeze rules, timestamp semantics, reader recovery, converter schemas
 - [docs/data-products.md](docs/data-products.md) — the consumer contract: dataset paths, schemas, join keys, caveats
-- [docs/implementation-plan.md](docs/implementation-plan.md) — the living plan: current phase status and the re-scoped remaining phases
-- [docs/report-fable-10062026.md](docs/report-fable-10062026.md) — target architecture and findings (R1–R12); its §7 roadmap carries as-built exit notes
-- [docs/archive/improvement_plan.md](docs/archive/improvement_plan.md) — the implemented Phase-0 remediation, with as-built amendments (archived)
+- [docs/implementation-plan.md](docs/implementation-plan.md) — the living plan: phase status (the single status surface) and the remaining phases
+- [docs/reality-check-fable-11062026.md](docs/reality-check-fable-11062026.md) — current full-source review: open findings RC-1..17

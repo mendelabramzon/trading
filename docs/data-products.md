@@ -85,8 +85,9 @@ file came from.
 - **Daily funding reconciliation**
   (`meta/reconciliation/<venue>/<date>.json`): captured settlements vs an
   independent REST refetch; `coverage_pct`, `missing[]`, `extra[]`,
-  `rate_mismatches[]`, and `consecutive_green_days` — the Phase-2 exit
-  criterion is the latest report reaching `>= 14`. Caveat recorded once
+  `rate_mismatches[]`, and `consecutive_green_days` (the capture plan's
+  exit criterion keys on this field — `docs/implementation-plan.md`).
+  Caveat recorded once
   here: live realized funding is itself REST-polled (the venue's WS family
   is dead), so this verifies pipeline completeness end-to-end, not
   dual-channel agreement.
